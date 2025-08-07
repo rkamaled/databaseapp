@@ -1,4 +1,32 @@
 /* Reset and base styles */
+:root {
+  --bg-primary: #E6EBF4;
+  --bg-header: #3B5998;
+  --bg-header-gradient: linear-gradient(135deg, #3B5998 0%, #2A4070 100%);
+  --text-primary: #000000;  /* Changed to black */
+  --text-header: #ffffff;
+  --accent-color: #FF7F50;
+  --shadow-color: rgba(0, 0, 0, 0.15);
+  --bg-card: #FFF3E0;  /* Light orange background for cards */
+  --bg-card-hover: #FFE0B2;  /* Slightly darker orange for hover states */
+  --border-color: #FFB74D;  /* Orange border color */
+  --text-secondary: #000000;  /* Changed to black */
+}
+
+.dark-mode {
+  --bg-primary: #1a1f36;
+  --bg-header: #0d1424;
+  --bg-header-gradient: linear-gradient(135deg, #0d1424 0%, #1a1f36 100%);
+  --text-primary: #ffffff;
+  --text-header: #ffffff;
+  --accent-color: #FF9F7D;
+  --shadow-color: rgba(0, 0, 0, 0.3);
+  --bg-card: #2a3349;
+  --bg-card-hover: #313b55;
+  --border-color: #3a4563;
+  --text-secondary: #a3adc2;
+}
+
 * {
   margin: 0;
   padding: 0;
@@ -11,8 +39,9 @@ body {
     sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  background-color: #f8fafc;
-  color: #334155;
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+  transition: background-color 0.3s ease, color 0.3s ease;
 }
 
 .App {
@@ -23,56 +52,132 @@ body {
 
 /* Header styles */
 .app-header {
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-  color: white;
-  padding: 1rem 0;
-  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+  background: var(--bg-header-gradient);
+  color: var(--text-header);
+  padding: 1.5rem 0;
+  box-shadow: 0 4px 20px var(--shadow-color);
   position: relative;
+  border-bottom: 4px solid var(--accent-color);
 }
 
 .header-content {
   width: 100%;
-  padding: 0 1rem;
+  position: relative;
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  position: relative;
 }
 
 .logo-section {
-  flex-shrink: 0;
+  position: absolute;
+  top: -0.75rem;
+  left: 1.5rem;
   z-index: 10;
-  margin-left: 0;
-  padding-left: 0;
 }
 
 .header-logo {
-  height: 90px;
+  height: 100px;
   width: auto;
-  border-radius: 8px;
-  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
-  margin-left: 0;
+  border-radius: 12px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+  transition: transform 0.3s ease;
+}
+
+.header-logo:hover {
+  transform: scale(1.05);
 }
 
 .header-text {
-  position: absolute;
-  left: 50%;
-  transform: translateX(-50%);
+  width: 100%;
   text-align: center;
-  z-index: 5;
+  padding-left: 140px; /* Make space for the logo */
 }
 
 .header-text h1 {
-  font-size: 2.5rem;
-  font-weight: 700;
-  margin-bottom: 0.5rem;
-  text-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+  font-size: 2.75rem;
+  font-weight: 800;
+  margin-bottom: 0.75rem;
+  background: linear-gradient(135deg, var(--accent-color) 0%, #FF9F7D 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  text-shadow: 2px 2px 4px var(--shadow-color);
+  letter-spacing: -0.5px;
 }
 
 .header-text p {
-  font-size: 1.1rem;
-  opacity: 0.9;
-  font-weight: 300;
+  font-size: 1.2rem;
+  color: var(--text-header);
+  font-weight: 400;
+  text-shadow: 1px 1px 2px var(--shadow-color);
+  letter-spacing: 0.5px;
+}
+
+/* Theme toggle button */
+.theme-toggle {
+  position: absolute;
+  right: 1.5rem;
+  top: 50%;
+  transform: translateY(-50%);
+  background: var(--bg-card);
+  border: 2px solid var(--accent-color);
+  color: var(--text-header);
+  width: 40px;
+  height: 80px;
+  border-radius: 20px;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px;
+  font-size: 1.25rem;
+  transition: all 0.3s ease;
+  z-index: 10;
+  overflow: hidden;
+}
+
+.theme-toggle::before {
+  content: '';
+  position: absolute;
+  width: 32px;
+  height: 32px;
+  background: var(--accent-color);
+  border-radius: 16px;
+  top: 4px;
+  left: 2px;
+  transition: transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+.theme-toggle.dark::before {
+  transform: translateY(38px);
+}
+
+.theme-toggle span {
+  position: relative;
+  z-index: 1;
+  transition: opacity 0.3s ease, transform 0.3s ease;
+}
+
+.theme-toggle .sun-icon {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.theme-toggle .moon-icon {
+  opacity: 0.5;
+  transform: translateY(0);
+}
+
+.theme-toggle.dark .sun-icon {
+  opacity: 0.5;
+}
+
+.theme-toggle.dark .moon-icon {
+  opacity: 1;
+}
+
+.theme-toggle:hover {
+  border-color: var(--accent-color);
+  box-shadow: 0 0 10px var(--accent-color);
 }
 
 /* Main content */
@@ -109,51 +214,104 @@ body {
 
 @media (max-width: 768px) {
   .app-header {
-    padding: 0.75rem 0;
+    padding: 1.25rem 0;
   }
   
-  .header-content {
-    padding: 0 0.75rem;
+  .logo-section {
+    top: -0.5rem;
+    left: 1rem;
   }
   
   .header-logo {
-    height: 75px;
+    height: 85px;
+  }
+  
+  .header-text {
+    padding-left: 100px;
+    padding-right: 50px;
   }
   
   .header-text h1 {
-    font-size: 1.75rem;
+    font-size: 2rem;
+    margin-bottom: 0.5rem;
   }
   
   .header-text p {
-    font-size: 1rem;
+    font-size: 1.1rem;
+  }
+
+  .theme-toggle {
+    right: 1rem;
+    width: 36px;
+    height: 72px;
+    font-size: 1.1rem;
+  }
+
+  .theme-toggle::before {
+    width: 28px;
+    height: 28px;
+    left: 2px;
+  }
+
+  .theme-toggle.dark::before {
+    transform: translateY(34px);
   }
   
   .app-main {
-    padding: 0.75rem;
+    padding: 1rem;
   }
 }
 
 @media (max-width: 480px) {
-  .header-content {
-    flex-direction: column;
-    gap: 0.75rem;
-  }
-  
-  .header-logo {
-    height: 65px;
-  }
-  
-  .header-text {
-    position: static;
-    transform: none;
-    order: 2;
+  .app-header {
+    padding: 1rem 0 0.5rem;
   }
   
   .logo-section {
-    order: 1;
+    position: relative;
+    top: 0;
+    left: auto;
+    margin: 0 auto 0.75rem;
+  }
+  
+  .header-logo {
+    height: 70px;
+  }
+  
+  .header-text {
+    padding-left: 0;
+    padding-right: 0;
+    margin-bottom: 0.75rem;
   }
   
   .header-text h1 {
-    font-size: 1.5rem;
+    font-size: 1.75rem;
+    margin-bottom: 0.4rem;
+  }
+  
+  .header-text p {
+    font-size: 1rem;
+    max-width: 280px;
+    margin: 0 auto;
+  }
+
+  .theme-toggle {
+    position: relative;
+    top: 0;
+    right: auto;
+    transform: none;
+    margin: 0.5rem auto 0;
+    width: 32px;
+    height: 64px;
+  }
+
+  .theme-toggle::before {
+    width: 24px;
+    height: 24px;
+    left: 2px;
+  }
+
+  .theme-toggle.dark::before {
+    transform: translateY(30px);
   }
 }

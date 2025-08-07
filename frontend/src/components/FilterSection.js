@@ -1,5 +1,6 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import './FilterSection.css';
+import { API_BASE_URL } from '../config';
 
 const FilterSection = ({ onSearch }) => {
   // State for the 3-level filtering system
@@ -8,59 +9,21 @@ const FilterSection = ({ onSearch }) => {
   const [variableSearch, setVariableSearch] = useState('');
   const [selectedCohorts, setSelectedCohorts] = useState([]);
 
-  // Data modalities (Level 1)
-  const dataModalities = {
-    diet: {
-      label: 'Diet Data',
-      description: 'Nutritional intake and dietary patterns',
-      variables: ['calorie_intake', 'protein_intake', 'carbohydrate_intake', 'fat_intake', 'fiber_intake', 'sugar_intake'],
-      variableLabels: {
-        calorie_intake: 'Calorie Intake',
-        protein_intake: 'Protein Intake',
-        carbohydrate_intake: 'Carbohydrate Intake',
-        fat_intake: 'Fat Intake',
-        fiber_intake: 'Fiber Intake',
-        sugar_intake: 'Sugar Intake'
-      }
-    },
-    genetic: {
-      label: 'Genetic Data',
-      description: 'Genetic markers and variants',
-      variables: ['gene_variant_1', 'gene_variant_2', 'risk_score', 'polygenic_score'],
-      variableLabels: {
-        gene_variant_1: 'Gene Variant 1',
-        gene_variant_2: 'Gene Variant 2',
-        risk_score: 'Risk Score',
-        polygenic_score: 'Polygenic Score'
-      }
-    },
-    anthropometric: {
-      label: 'Anthropometric Data',
-      description: 'Physical measurements and body composition',
-      variables: ['height', 'weight', 'bmi', 'body_fat_percentage', 'muscle_mass', 'waist_circumference'],
-      variableLabels: {
-        height: 'Height',
-        weight: 'Weight',
-        bmi: 'BMI',
-        body_fat_percentage: 'Body Fat Percentage',
-        muscle_mass: 'Muscle Mass',
-        waist_circumference: 'Waist Circumference'
-      }
-    },
-    demographic: {
-      label: 'Demographic Data',
-      description: 'Personal and demographic information',
-      variables: ['age', 'gender', 'ethnicity', 'education_level', 'income_level', 'marital_status'],
-      variableLabels: {
-        age: 'Age',
-        gender: 'Gender',
-        ethnicity: 'Ethnicity',
-        education_level: 'Education Level',
-        income_level: 'Income Level',
-        marital_status: 'Marital Status'
-      }
-    }
-  };
+  // State for available modalities and variables
+  const [availableModalities, setAvailableModalities] = useState([]);
+  const [availableVariables, setAvailableVariables] = useState({});  // Store variables by modality and cohort
+
+  // Fetch modalities from backend
+  useEffect(() => {
+    fetch(`${API_BASE_URL}/get-modalities`)
+      .then(response => response.json())
+      .then(data => {
+        if (data.status === 'success') {
+          setAvailableModalities(data.modalities);
+        }
+      })
+      .catch(error => console.error('Error fetching modalities:', error));
+  }, []);
 
   // Timepoints (1-6 or all)
   const timepoints = [
@@ -111,7 +74,7 @@ const FilterSection = ({ onSearch }) => {
   // Add logic parameter to a filter (Level 2)
   // Cohort options
   const cohortOptions = [
-    { value: 'adult', label: 'Adult' },
+    { value: 'adults', label: 'Adults' },
     { value: 'children', label: 'Children' }
   ];
 
@@ -174,18 +137,30 @@ const FilterSection = ({ onSearch }) => {
 
   // Update logic parameter cohorts
   const updateLogicParameterCohorts = (filterId, logicParamId, cohorts) => {
-    setFilters(prev => prev.map(f => 
-      f.id === filterId 
-        ? { 
-            ...f, 
-            logicParameters: f.logicParameters.map(lp => 
-              lp.id === logicParamId 
-                ? { ...lp, cohorts }
-                : lp
-            )
+    setFilters(prev => prev.map(f => {
+      if (f.id === filterId) {
+        // Get the modality for this filter
+        const modality = f.modality;
+        
+        // For each selected cohort, fetch variables if we haven't already
+        cohorts.forEach(cohort => {
+          const key = `${modality}-${cohort}`;
+          if (!availableVariables[key]) {
+            fetchVariables(modality, cohort);
           }
-        : f
-    ));
+        });
+
+        return { 
+          ...f, 
+          logicParameters: f.logicParameters.map(lp => 
+            lp.id === logicParamId 
+              ? { ...lp, cohorts, variables: [] }  // Reset variables when cohorts change
+              : lp
+          )
+        };
+      }
+      return f;
+    }));
   };
 
   // Add threshold to logic parameter (Level 3)
@@ -251,14 +226,28 @@ const FilterSection = ({ onSearch }) => {
     ));
   };
 
+  // Function to get variables from backend based on modality and cohort
+  const fetchVariables = async (modality, cohortType) => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/get-variables/${modality}/${cohortType}`);
+      const data = await response.json();
+      if (data.status === 'success') {
+        setAvailableVariables(prev => ({
+          ...prev,
+          [`${modality}-${cohortType}`]: data.variables
+        }));
+      }
+    } catch (error) {
+      console.error('Error fetching variables:', error);
+    }
+  };
+
   // Function to filter variables based on search
-  const getFilteredVariables = (modality, searchTerm) => {
-    if (!searchTerm) return [];
-    const variables = dataModalities[modality].variables;
+  const getFilteredVariables = (modality, cohortType, searchTerm) => {
+    if (!searchTerm || !cohortType) return [];
+    const variables = availableVariables[`${modality}-${cohortType}`] || [];
     return variables.filter(variable => 
-      dataModalities[modality].variableLabels[variable]
-        .toLowerCase()
-        .includes(searchTerm.toLowerCase())
+      variable.name.toLowerCase().includes(searchTerm.toLowerCase())
     );
   };
 
@@ -278,11 +267,9 @@ const FilterSection = ({ onSearch }) => {
       }))
     }));
 
-    // Simulate API call
-    setTimeout(() => {
-      onSearch(processedFilters);
-      setIsLoading(false);
-    }, 1000);
+    // Send the search request immediately
+    onSearch(processedFilters);
+    setIsLoading(false);
   };
 
   // Clear all filters
@@ -325,9 +312,9 @@ const FilterSection = ({ onSearch }) => {
                   className="modality-select"
                 >
                   <option value="">Select Data Modality...</option>
-                  {Object.entries(dataModalities).map(([key, modality]) => (
-                    <option key={key} value={key}>
-                      {modality.label}
+                  {availableModalities.map(modality => (
+                    <option key={modality} value={modality}>
+                      {modality}
                     </option>
                   ))}
                 </select>
@@ -389,41 +376,49 @@ const FilterSection = ({ onSearch }) => {
                             type="text"
                             value={variableSearch}
                             onChange={(e) => setVariableSearch(e.target.value)}
-                            placeholder="Search variables..."
+                            placeholder={logicParam.cohorts.length === 0 ? "Select cohort first..." : "Search variables..."}
                             className="variable-search-input"
+                            disabled={logicParam.cohorts.length === 0}
                           />
                           <div className="variable-search-results">
-                            {variableSearch && getFilteredVariables(filter.modality, variableSearch).map(variable => (
-                              <div 
-                                key={variable} 
-                                className="variable-search-item"
-                                onClick={() => {
-                                  if (!logicParam.variables.includes(variable)) {
-                                    updateLogicParameterVariables(
-                                      filter.id, 
-                                      logicParam.id, 
-                                      [...logicParam.variables, variable]
-                                    );
-                                  }
-                                  setVariableSearch('');
-                                }}
-                              >
-                                {dataModalities[filter.modality].variableLabels[variable]}
+                            {variableSearch && logicParam.cohorts.map(cohort => (
+                              <div key={cohort} className="cohort-variables-group">
+                                <h6>{cohort === 'children' ? 'Child Variables' : 'Adults Variables'}</h6>
+                                <div className="variable-list">
+                                  {getFilteredVariables(filter.modality, cohort, variableSearch).map(variable => (
+                                    <div 
+                                      key={variable.name} 
+                                      className="variable-search-item"
+                                      onClick={() => {
+                                        if (!logicParam.variables.find(v => v.name === variable.name)) {
+                                          updateLogicParameterVariables(
+                                            filter.id, 
+                                            logicParam.id, 
+                                            [...logicParam.variables, variable]
+                                          );
+                                        }
+                                        setVariableSearch('');
+                                      }}
+                                    >
+                                      {variable.name}
+                                    </div>
+                                  ))}
+                                </div>
                               </div>
                             ))}
                           </div>
                         </div>
                         <div className="selected-variables">
                           {logicParam.variables.map(variable => (
-                            <div key={variable} className="selected-variable-tag">
-                              {dataModalities[filter.modality].variableLabels[variable]}
+                            <div key={variable.name} className="selected-variable-tag">
+                              {variable.name}
                               <button
                                 type="button"
                                 onClick={() => {
                                   updateLogicParameterVariables(
                                     filter.id,
                                     logicParam.id,
-                                    logicParam.variables.filter(v => v !== variable)
+                                    logicParam.variables.filter(v => v.name !== variable.name)
                                   );
                                 }}
                                 className="remove-variable-btn"
@@ -476,14 +471,19 @@ const FilterSection = ({ onSearch }) => {
                           <div key={threshold.id} className="threshold-card">
                             <div className="threshold-header">
                               <select
-                                value={threshold.variable}
-                                onChange={(e) => updateThreshold(filter.id, logicParam.id, threshold.id, 'variable', e.target.value)}
+                                value={threshold.variable ? threshold.variable.name : ''}
+                                onChange={(e) => {
+                                  const selectedVar = logicParam.variables.find(v => v.name === e.target.value);
+                                  updateThreshold(filter.id, logicParam.id, threshold.id, 'variable', selectedVar);
+                                  // Reset operator when variable changes
+                                  updateThreshold(filter.id, logicParam.id, threshold.id, 'operator', '');
+                                }}
                                 className="variable-select"
                               >
                                 <option value="">Select Variable...</option>
                                 {logicParam.variables.map(variable => (
-                                  <option key={variable} value={variable}>
-                                    {dataModalities[filter.modality].variableLabels[variable]}
+                                  <option key={variable.name} value={variable.name}>
+                                    {variable.name}
                                   </option>
                                 ))}
                               </select>
@@ -501,26 +501,29 @@ const FilterSection = ({ onSearch }) => {
                                 value={threshold.operator}
                                 onChange={(e) => updateThreshold(filter.id, logicParam.id, threshold.id, 'operator', e.target.value)}
                                 className="operator-select"
+                                disabled={!threshold.variable}
                               >
                                 <option value="">Operator...</option>
-                                {thresholdOperators.map(op => (
+                                {threshold.variable && threshold.variable.operators.map(op => (
                                   <option key={op.value} value={op.value}>
                                     {op.label}
                                   </option>
                                 ))}
                               </select>
 
-                              <input
-                                type="number"
-                                value={threshold.value}
-                                onChange={(e) => updateThreshold(filter.id, logicParam.id, threshold.id, 'value', e.target.value)}
-                                placeholder="Value"
-                                className="threshold-input"
-                              />
-
-                              {threshold.operator === 'between' && (
+                              {threshold.variable && threshold.operator && threshold.operator !== 'IS NULL' && threshold.operator !== 'IS NOT NULL' && (
                                 <input
-                                  type="number"
+                                  type={threshold.variable.type === 'number' ? 'number' : threshold.variable.type === 'datetime' ? 'datetime-local' : 'text'}
+                                  value={threshold.value}
+                                  onChange={(e) => updateThreshold(filter.id, logicParam.id, threshold.id, 'value', e.target.value)}
+                                  placeholder="Value"
+                                  className="threshold-input"
+                                />
+                              )}
+
+                              {threshold.variable && threshold.operator === 'between' && (
+                                <input
+                                  type={threshold.variable.type === 'number' ? 'number' : threshold.variable.type === 'datetime' ? 'datetime-local' : 'text'}
                                   value={threshold.value2}
                                   onChange={(e) => updateThreshold(filter.id, logicParam.id, threshold.id, 'value2', e.target.value)}
                                   placeholder="Second value"

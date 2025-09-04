@@ -25,7 +25,7 @@ const FilterSection = ({ onSearch }) => {
       .catch(error => console.error('Error fetching modalities:', error));
   }, []);
 
-  // Timepoints (1-6 or all)
+  // Timepoints (1-9 or all)
   const timepoints = [
     { value: 'all', label: 'All Timepoints' },
     { value: 1, label: 'Timepoint 1' },
@@ -33,7 +33,10 @@ const FilterSection = ({ onSearch }) => {
     { value: 3, label: 'Timepoint 3' },
     { value: 4, label: 'Timepoint 4' },
     { value: 5, label: 'Timepoint 5' },
-    { value: 6, label: 'Timepoint 6' }
+    { value: 6, label: 'Timepoint 6' },
+    { value: 7, label: 'Timepoint 7' },
+    { value: 8, label: 'Timepoint 8' },
+    { value: 9, label: 'Timepoint 9' }
   ];
 
   // Threshold operators
@@ -135,6 +138,34 @@ const FilterSection = ({ onSearch }) => {
     ));
   };
 
+  // Handle timepoint selection with "All Timepoints" logic
+  const handleTimepointChange = (filterId, logicParamId, currentTimepoints, timepointValue, isChecked) => {
+    let newTimepoints;
+    
+    if (timepointValue === 'all') {
+      // If "All Timepoints" is being selected, clear other selections
+      if (isChecked) {
+        newTimepoints = ['all'];
+      } else {
+        newTimepoints = [];
+      }
+    } else {
+      // If individual timepoint is being selected
+      if (isChecked) {
+        // Remove 'all' if it was selected and add the individual timepoint
+        newTimepoints = currentTimepoints.filter(t => t !== 'all');
+        if (!newTimepoints.includes(timepointValue)) {
+          newTimepoints.push(timepointValue);
+        }
+      } else {
+        // Remove the individual timepoint
+        newTimepoints = currentTimepoints.filter(t => t !== timepointValue);
+      }
+    }
+    
+    updateLogicParameterTimepoints(filterId, logicParamId, newTimepoints);
+  };
+
   // Update logic parameter cohorts
   const updateLogicParameterCohorts = (filterId, logicParamId, cohorts) => {
     setFilters(prev => prev.map(f => {
@@ -170,7 +201,8 @@ const FilterSection = ({ onSearch }) => {
       variable: '',
       operator: '',
       value: '',
-      value2: '' // For 'between' operator
+      value2: '', // For 'between' operator
+      cohortScope: '' // 'adults' | 'children' | 'both' (optional)
     };
     
     setFilters(prev => prev.map(f => 
@@ -254,6 +286,9 @@ const FilterSection = ({ onSearch }) => {
   // Handle search submission
   const handleSubmit = (e) => {
     e.preventDefault();
+    if (isSearchDisabled()) {
+      return;
+    }
     setIsLoading(true);
     
     // Convert the hierarchical filters to a format that can be processed
@@ -275,6 +310,13 @@ const FilterSection = ({ onSearch }) => {
   // Clear all filters
   const handleClear = () => {
     setFilters([]);
+  };
+
+  // Check if search should be disabled
+  const isSearchDisabled = () => {
+    if (filters.length === 0) return true;
+    // Require at least one logic parameter to be added for every filter
+    return filters.some(filter => !filter.logicParameters || filter.logicParameters.length === 0);
   };
 
   return (
@@ -348,7 +390,7 @@ const FilterSection = ({ onSearch }) => {
                       </div>
                       {/* Cohort Selection */}
                       <div className="param-group">
-                        <label>Cohort:</label>
+                        <label>Cohort: <span className="required-field">*</span></label>
                         <div className="checkbox-group">
                           {cohortOptions.map(cohort => (
                             <label key={cohort.value} className="checkbox-label">
@@ -366,6 +408,9 @@ const FilterSection = ({ onSearch }) => {
                             </label>
                           ))}
                         </div>
+                        {logicParam.cohorts.length === 0 && (
+                          <div className="validation-message">Please select at least one cohort</div>
+                        )}
                       </div>
 
                       {/* Variables Selection */}
@@ -385,12 +430,12 @@ const FilterSection = ({ onSearch }) => {
                               <div key={cohort} className="cohort-variables-group">
                                 <h6>{cohort === 'children' ? 'Child Variables' : 'Adults Variables'}</h6>
                                 <div className="variable-list">
-                                  {getFilteredVariables(filter.modality, cohort, variableSearch).map(variable => (
+                                      {getFilteredVariables(filter.modality, cohort, variableSearch).map(variable => (
                                     <div 
                                       key={variable.name} 
                                       className="variable-search-item"
                                       onClick={() => {
-                                        if (!logicParam.variables.find(v => v.name === variable.name)) {
+                                        if (!logicParam.variables.find(v => v.name === variable.name && v.cohort === variable.cohort)) {
                                           updateLogicParameterVariables(
                                             filter.id, 
                                             logicParam.id, 
@@ -410,15 +455,16 @@ const FilterSection = ({ onSearch }) => {
                         </div>
                         <div className="selected-variables">
                           {logicParam.variables.map(variable => (
-                            <div key={variable.name} className="selected-variable-tag">
+                            <div key={`${variable.cohort}:${variable.name}`} className="selected-variable-tag">
                               {variable.name}
+                              <span className="cohort-badge">{variable.cohort === 'children' ? 'Child' : 'Adult'}</span>
                               <button
                                 type="button"
                                 onClick={() => {
                                   updateLogicParameterVariables(
                                     filter.id,
                                     logicParam.id,
-                                    logicParam.variables.filter(v => v.name !== variable.name)
+                                        logicParam.variables.filter(v => !(v.name === variable.name && v.cohort === variable.cohort))
                                   );
                                 }}
                                 className="remove-variable-btn"
@@ -432,7 +478,7 @@ const FilterSection = ({ onSearch }) => {
 
                       {/* Timepoints Selection */}
                       <div className="param-group">
-                        <label>Timepoints:</label>
+                        <label>Timepoints: <span className="required-field">*</span></label>
                         <div className="checkbox-group">
                           {timepoints.map(timepoint => (
                             <label key={timepoint.value} className="checkbox-label">
@@ -440,16 +486,22 @@ const FilterSection = ({ onSearch }) => {
                                 type="checkbox"
                                 checked={logicParam.timepoints.includes(timepoint.value)}
                                 onChange={(e) => {
-                                  const newTimepoints = e.target.checked
-                                    ? [...logicParam.timepoints, timepoint.value]
-                                    : logicParam.timepoints.filter(t => t !== timepoint.value);
-                                  updateLogicParameterTimepoints(filter.id, logicParam.id, newTimepoints);
+                                  handleTimepointChange(
+                                    filter.id, 
+                                    logicParam.id, 
+                                    logicParam.timepoints, 
+                                    timepoint.value, 
+                                    e.target.checked
+                                  );
                                 }}
                               />
                               {timepoint.label}
                             </label>
                           ))}
                         </div>
+                        {logicParam.timepoints.length === 0 && (
+                          <div className="validation-message">Please select at least one timepoint</div>
+                        )}
                       </div>
 
                       {/* Level 3: Thresholds */}
@@ -473,17 +525,24 @@ const FilterSection = ({ onSearch }) => {
                               <select
                                 value={threshold.variable ? threshold.variable.name : ''}
                                 onChange={(e) => {
-                                  const selectedVar = logicParam.variables.find(v => v.name === e.target.value);
-                                  updateThreshold(filter.id, logicParam.id, threshold.id, 'variable', selectedVar);
+                                  const selectedName = e.target.value;
+                                  const candidates = logicParam.variables.filter(v => v.name === selectedName);
+                                  const preferred = candidates.find(v => v.cohort === 'adults') || candidates[0];
+                                  updateThreshold(filter.id, logicParam.id, threshold.id, 'variable', preferred);
                                   // Reset operator when variable changes
                                   updateThreshold(filter.id, logicParam.id, threshold.id, 'operator', '');
+                                  // Set cohort scope based on availability
+                                  const hasAdults = candidates.some(v => v.cohort === 'adults');
+                                  const hasChildren = candidates.some(v => v.cohort === 'children');
+                                  const scope = hasAdults && hasChildren ? 'both' : (preferred.cohort || '');
+                                  updateThreshold(filter.id, logicParam.id, threshold.id, 'cohortScope', scope);
                                 }}
                                 className="variable-select"
                               >
                                 <option value="">Select Variable...</option>
-                                {logicParam.variables.map(variable => (
-                                  <option key={variable.name} value={variable.name}>
-                                    {variable.name}
+                                {Array.from(new Set(logicParam.variables.map(v => v.name))).map(name => (
+                                  <option key={name} value={name}>
+                                    {name}
                                   </option>
                                 ))}
                               </select>
@@ -531,6 +590,61 @@ const FilterSection = ({ onSearch }) => {
                                 />
                               )}
                             </div>
+
+                            {/* Cohort scope selector when the same variable exists in both cohorts */}
+                            {(() => {
+                              const selectedName = threshold.variable ? threshold.variable.name : null;
+                              const candidates = selectedName ? logicParam.variables.filter(v => v.name === selectedName) : [];
+                              const hasAdults = candidates.some(v => v.cohort === 'adults');
+                              const hasChildren = candidates.some(v => v.cohort === 'children');
+                              if (selectedName && hasAdults && hasChildren) {
+                                const scope = threshold.cohortScope || 'both';
+                                return (
+                                  <div className="cohort-scope-selector">
+                                    <label className="label-text">Apply to cohort:</label>
+                                    <label className="radio-label">
+                                      <input
+                                        type="radio"
+                                        checked={scope === 'adults'}
+                                        onChange={() => {
+                                          const adultsVar = candidates.find(v => v.cohort === 'adults');
+                                          if (adultsVar) {
+                                            updateThreshold(filter.id, logicParam.id, threshold.id, 'variable', adultsVar);
+                                          }
+                                          updateThreshold(filter.id, logicParam.id, threshold.id, 'cohortScope', 'adults');
+                                        }}
+                                      />
+                                      <span>Adults</span>
+                                    </label>
+                                    <label className="radio-label">
+                                      <input
+                                        type="radio"
+                                        checked={scope === 'children'}
+                                        onChange={() => {
+                                          const childVar = candidates.find(v => v.cohort === 'children');
+                                          if (childVar) {
+                                            updateThreshold(filter.id, logicParam.id, threshold.id, 'variable', childVar);
+                                          }
+                                          updateThreshold(filter.id, logicParam.id, threshold.id, 'cohortScope', 'children');
+                                        }}
+                                      />
+                                      <span>Children</span>
+                                    </label>
+                                    <label className="radio-label">
+                                      <input
+                                        type="radio"
+                                        checked={scope === 'both'}
+                                        onChange={() => {
+                                          updateThreshold(filter.id, logicParam.id, threshold.id, 'cohortScope', 'both');
+                                        }}
+                                      />
+                                      <span>Both</span>
+                                    </label>
+                                  </div>
+                                );
+                              }
+                              return null;
+                            })()}
                           </div>
                         ))}
                       </div>
@@ -546,7 +660,7 @@ const FilterSection = ({ onSearch }) => {
           <button 
             type="submit" 
             className="btn btn-primary"
-            disabled={isLoading || filters.length === 0}
+            disabled={isLoading || isSearchDisabled()}
           >
             {isLoading ? 'Searching...' : 'Search'}
           </button>

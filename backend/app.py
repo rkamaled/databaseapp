@@ -23,26 +23,38 @@ DB_CONFIG = {
 
 # Modality to table mapping 
 MODALITY_MAPPING = {
-    'Diet_Data_Totals': {
+    'Diet Data Totals': {
         'tables': [
             {'name': 'asa24_children_totals_2025', 'type': 'children', "gender_column": ""},
             {'name': 'asa24_parents_totals_2025', 'type': 'adults', "gender_column": ""}
         ]
     },
-    'Qualtrics_Data': {
+    'Qualtrics Data': {
         'tables': [
             {'name': 'qualtrics_children_data_2025', 'type': 'children', "gender_column": "gender"},
             # {'name': 'qualtrics_children_data_2025_coded', 'type': 'child', "gender_column": "gender"},
-            {'name': 'qualtrics_parent_data_2025', 'type': 'adults', "gender_column": "gender_v2"}
+            {'name': 'qualtrics_parent_data_2025', 'type': 'adults', "gender_column": "gender_v2"},
             # {'name': 'qualtrics_parent_data_2025_coded', 'type': 'parent', "gender_column": "gender_v2"}
+            {'name': 'children_self_report_2025', 'type': 'children', "gender_column": "gender"}
         ]
     },
-    'Demographic_Data': {
+    'Demographic Data': {
         'tables': [
             {'name': 'child_demographics_2025', 'type': 'children', "gender_column": "gender"},
             {'name': 'parent_demographics_2025', 'type': 'adults', "gender_column": "gender_v2"}
         ]
+    },
+    'Life-labs Data': {
+        'tables': [
+            {'name': 'life_labs_2025', 'type': 'both', "gender_column": ""},
+        ]
     }
+    
+    # 'Genotype Data': {
+    #     'tables': [
+    #         {'name': 'genotype_data_2025', 'type': '*', "gender_column": ""},
+    #     ]
+    # }
 }
 
 def get_db_connection():
@@ -127,9 +139,10 @@ def get_variables(modality, cohort_type):
             return jsonify({'status': 'error', 'message': 'Invalid modality'}), 400
 
         # Get tables for the selected modality and cohort type
+        # If a table is of type 'both', expose its columns for either cohort
         tables = [
             table['name'] for table in MODALITY_MAPPING[modality]['tables']
-            if table['type'] == cohort_type
+            if table['type'] == cohort_type or (table['type'] == 'both' and cohort_type in ['children', 'adults'])
         ]
 
         if not tables:
@@ -165,8 +178,16 @@ def get_variables(modality, cohort_type):
                         variables[col_name] = {
                             'name': col_name,
                             'type': data_type,
-                            'operators': get_operators_for_type(data_type)
+                            'operators': get_operators_for_type(data_type),
+                            'cohort': cohort_type,
+                            'tables': [table]
                         }
+                    else:
+                        # Merge table membership for this variable
+                        if 'tables' not in variables[col_name] or not isinstance(variables[col_name]['tables'], list):
+                            variables[col_name]['tables'] = []
+                        if table not in variables[col_name]['tables']:
+                            variables[col_name]['tables'].append(table)
             except pyodbc.Error as e:
                 print(f"Error getting columns from {table}: {e}")
 
@@ -201,6 +222,27 @@ def _build_not_null_conditions(variables):
     conditions = [f"t.{var['name']} IS NOT NULL" for var in variables]  # Use table alias 't' for variables
     return " AND ".join(conditions)
 
+def _build_pid_filter_conditions(table_type, selected_cohorts):
+    """Build SQL conditions to filter PIDs based on table type and selected cohorts"""
+    if table_type != 'both':
+        return "1=1"  # No filtering for non-both tables
+    
+    conditions = []
+    
+    if 'children' in selected_cohorts:
+        # Children: PID begins with 'a', 'b', or 'c' (case insensitive)
+        conditions.append("(UPPER(LEFT(t.pid, 1)) IN ('A', 'B', 'C'))")
+    
+    if 'adults' in selected_cohorts or 'adult' in selected_cohorts:
+        # Adults: PID begins with 'p' or 's' (case insensitive)
+        conditions.append("(UPPER(LEFT(t.pid, 1)) IN ('P', 'S'))")
+    
+    if conditions:
+        return " OR ".join(conditions)
+    else:
+        # If no specific cohorts selected for a 'both' table, include all valid PIDs
+        return "(UPPER(LEFT(t.pid, 1)) IN ('A', 'B', 'C', 'P', 'S'))"
+
 def build_filter_queries(modality, logic_parameters):
     """Build SQL queries for a specific modality and its logic parameters"""
     # Get the actual table mappings for this modality
@@ -231,10 +273,47 @@ def build_filter_queries(modality, logic_parameters):
         for table_config in modality_config['tables']:
             table_type = table_config['type']
             if (table_type == 'children' and has_children) or \
-               (table_type == 'adults' and has_adults):
+               (table_type == 'adults' and has_adults) or \
+               (table_type == 'both' and (has_children or has_adults)):
                 selected_tables.append(table_config)
 
     # Build a query for each selected table
+    # Discover columns for each selected table to scope variables/thresholds safely
+    columns_per_table = {}
+    column_types_per_table = {}
+    try:
+        conn_cols = get_db_connection()
+        if conn_cols:
+            cur_cols = conn_cols.cursor()
+            for table_cfg in selected_tables:
+                tname = table_cfg['name']
+                try:
+                    cur_cols.execute(f"SELECT TOP 0 * FROM {tname}")
+                    # Collect column names and coarse type categories
+                    col_names = set()
+                    col_types = {}
+                    for col in cur_cols.description:
+                        col_name = col[0]
+                        col_names.add(col_name)
+                        type_name = col[1].__name__.lower()
+                        if type_name in ['int', 'bigint', 'smallint', 'tinyint', 'decimal', 'numeric', 'float', 'real']:
+                            cat = 'number'
+                        elif type_name in ['datetime', 'date', 'time', 'datetime2', 'datetimeoffset']:
+                            cat = 'datetime'
+                        elif type_name in ['char', 'varchar', 'text', 'nchar', 'nvarchar', 'ntext']:
+                            cat = 'string'
+                        else:
+                            cat = 'other'
+                        col_types[col_name] = cat
+                    columns_per_table[tname] = col_names
+                    column_types_per_table[tname] = col_types
+                except Exception:
+                    columns_per_table[tname] = set()
+                    column_types_per_table[tname] = {}
+            cur_cols.close()
+            conn_cols.close()
+    except Exception:
+        pass
     for table_config in selected_tables:
         table_name = table_config['name']
         table_type = table_config['type']
@@ -245,16 +324,90 @@ def build_filter_queries(modality, logic_parameters):
         timepoints = logic_param.get('timepoints') if logic_param and logic_param.get('timepoints') else []
         thresholds = logic_param.get('thresholds') if logic_param and logic_param.get('thresholds') else []
         cohorts = logic_param.get('cohorts') if logic_param and logic_param.get('cohorts') else []
+        # Variables scoped to the current table's cohort and membership
+        # For 'both' type tables, include variables for both 'adults' and 'children' cohorts
+        if table_type == 'both':
+            variables_for_table = []
+            for var in (logic_param.get('variables') or []):
+                if not isinstance(var, dict):
+                    continue
+                if var.get('cohort') not in ['adults', 'children', 'both']:
+                    continue
+                var_name = var.get('name')
+                var_tables = var.get('tables') if isinstance(var.get('tables'), list) else None
+                has_column = False
+                if var_tables:
+                    has_column = table_name in var_tables
+                else:
+                    table_cols = columns_per_table.get(table_name)
+                    has_column = (var_name in table_cols) if isinstance(table_cols, set) else True
+                if has_column:
+                    variables_for_table.append(var)
+        else:
+            variables_for_table = []
+            for var in (logic_param.get('variables') or []):
+                if not isinstance(var, dict):
+                    continue
+                if var.get('cohort') != table_type:
+                    continue
+                var_name = var.get('name')
+                var_tables = var.get('tables') if isinstance(var.get('tables'), list) else None
+                has_column = False
+                if var_tables:
+                    has_column = table_name in var_tables
+                else:
+                    table_cols = columns_per_table.get(table_name)
+                    has_column = (var_name in table_cols) if isinstance(table_cols, set) else True
+                if has_column:
+                    variables_for_table.append(var)
+        thresholds_for_table = []
+        for th in thresholds:
+            var = th.get('variable') if isinstance(th, dict) else None
+            scope = th.get('cohortScope') if isinstance(th, dict) else None
+            if not var or not isinstance(var, dict):
+                continue
+            var_cohort = var.get('cohort')
+            # Respect table membership if provided; otherwise check discovered columns
+            var_tables = var.get('tables') if isinstance(var, dict) else None
+            if isinstance(var_tables, list):
+                if table_name not in var_tables:
+                    continue
+            else:
+                table_cols = columns_per_table.get(table_name)
+                var_name = var.get('name') if isinstance(var, dict) else None
+                if isinstance(table_cols, set) and var_name not in table_cols:
+                    continue
+            # Apply to both tables if scope == 'both' (assumes column exists on both cohort tables)
+            if scope == 'both':
+                thresholds_for_table.append(th)
+                continue
+            # Otherwise, apply only if variable belongs to this table and scope includes this table
+            if table_type == 'both':
+                # For 'both' type tables, include thresholds for 'adults', 'children', and 'both' cohorts
+                if var_cohort in ['adults', 'children', 'both'] and (scope in (None, '', var_cohort, 'both')):
+                    thresholds_for_table.append(th)
+            elif var_cohort == table_type and (scope in (None, '', table_type)):
+                thresholds_for_table.append(th)
         
         # If no timepoints specified, empty list, or 'all' selected, use all timepoints
         if not timepoints or timepoints == [] or 'all' in timepoints:
-            timepoints = [1, 2, 3, 4, 5, 6]  # All timepoints must be present
+            timepoints = [1, 2, 3, 4, 5, 6, 7, 8, 9]  # All timepoints must be present
+        # Otherwise, use the specific timepoints selected
         
         # Make sure timepoints are integers
         timepoint_params = [int(tp) for tp in timepoints]
         
 
-        base_query = f"""
+        # Build conditional HAVING clause for NOT NULL checks only if variables are provided for this table
+        having_not_null_clause_single = (
+            f" AND COUNT(CASE WHEN {_build_not_null_conditions(variables_for_table)} THEN 1 END) = {len(timepoints)}"
+            if variables_for_table else ""
+        )
+
+        # Build PID filtering conditions for 'both' type tables
+        pid_filter_condition = _build_pid_filter_conditions(table_type, selected_cohorts)
+
+        base_cte = f"""
         WITH ParticipantGenders AS (
             SELECT 
                 v.pid,
@@ -263,14 +416,44 @@ def build_filter_queries(modality, logic_parameters):
                 SELECT t.pid
                 FROM {table_name} t
                 WHERE t.time_point IN ({','.join(['?' for _ in timepoints])})
+                  AND {pid_filter_condition}
                 GROUP BY t.pid
-                HAVING COUNT(DISTINCT t.time_point) = {len(timepoints)}
-                AND COUNT(CASE WHEN {_build_not_null_conditions(logic_param.get('variables', []))} THEN 1 END) = {len(timepoints)}
+                HAVING COUNT(DISTINCT t.time_point) = {len(timepoints)}{having_not_null_clause_single}
             ) v
             LEFT JOIN {table_name} t ON v.pid = t.pid
             LEFT JOIN {PARTICIPANTS_TABLE} p ON v.pid = p.pid
             GROUP BY v.pid, p.gender
         )
+    """
+
+        if table_type == 'both':
+            final_select = """
+        SELECT 
+            COUNT(DISTINCT pid) as count,
+            CASE 
+                WHEN UPPER(LEFT(pid, 1)) IN ('A', 'B', 'C') THEN 'children'
+                WHEN UPPER(LEFT(pid, 1)) IN ('P', 'S') THEN 'adults'
+                ELSE 'other'
+            END as source,
+            SUM(CASE WHEN gender IN ('M', 'MALE') OR LOWER(gender) = 'male' THEN 1 ELSE 0 END) as male_count,
+            SUM(CASE WHEN gender IN ('F', 'FEMALE') OR LOWER(gender) = 'female' THEN 1 ELSE 0 END) as female_count,
+            SUM(CASE 
+                WHEN gender IS NULL THEN 0
+                WHEN gender NOT IN ('M', 'MALE', 'F', 'FEMALE') 
+                    AND LOWER(gender) NOT IN ('male', 'female') 
+                THEN 1 
+                ELSE 0 
+            END) as other_count
+        FROM ParticipantGenders
+        GROUP BY 
+            CASE 
+                WHEN UPPER(LEFT(pid, 1)) IN ('A', 'B', 'C') THEN 'children'
+                WHEN UPPER(LEFT(pid, 1)) IN ('P', 'S') THEN 'adults'
+                ELSE 'other'
+            END
+            """
+        else:
+            final_select = f"""
         SELECT 
             COUNT(DISTINCT pid) as count,
             '{table_type}' as source,
@@ -284,13 +467,15 @@ def build_filter_queries(modality, logic_parameters):
                 ELSE 0 
             END) as other_count
         FROM ParticipantGenders
-    """
+            """
+
+        base_query = base_cte + final_select
         conditions = []
         params = timepoint_params.copy()  # These are used in the IN clause of the CTE
 
         # Handle thresholds
         threshold_conditions = []
-        for threshold in thresholds:
+        for threshold in thresholds_for_table:
             variable_obj = threshold.get('variable')
             operator = threshold.get('operator')
             value = threshold.get('value')
@@ -350,129 +535,182 @@ def build_filter_queries(modality, logic_parameters):
     
             # If we have multiple tables, we'll need to combine their results
     if len(queries) > 1:
-        # For SQL Server, we need to define all CTEs first, then do the UNION ALL
-        # Process threshold conditions for each CTE
-        threshold_conditions_1 = []
-        threshold_conditions_2 = []
-        
-        # Handle thresholds for both CTEs
-        for threshold in thresholds:
-            variable_obj = threshold.get('variable')
-            operator = threshold.get('operator')
-            value = threshold.get('value')
-            value2 = threshold.get('value2')
+        # If multiple tables share the same cohort (not 'both'), build a merged UNION-based CTE
+        logic_param = logic_parameters[0] if logic_parameters and len(logic_parameters) > 0 else {}
+        all_thresholds = logic_param.get('thresholds') or []
+        all_variables = logic_param.get('variables') or []
 
-            if not variable_obj or not operator:
-                continue
-            if operator not in ['IS NULL','IS NOT NULL'] and value is None:
-                continue
+        same_type = len({t['type'] for t in selected_tables}) == 1
+        cohort_type = selected_tables[0]['type'] if same_type else None
+        if same_type and cohort_type in ['children', 'adults']:
+            # Build union column set
+            union_columns = set()
+            for tcfg in selected_tables:
+                tcols = columns_per_table.get(tcfg['name']) or set()
+                for c in tcols:
+                    if c.lower() not in ['pid', 'time_point']:
+                        union_columns.add(c)
+            union_columns = sorted(union_columns)
 
+            # Decide a target SQL type per union column based on available categories
+            union_target_types = {}
+            for col in union_columns:
+                target_cat = None
+                for tcfg in selected_tables:
+                    tname_scan = tcfg['name']
+                    ttypes = column_types_per_table.get(tname_scan) or {}
+                    if col in ttypes:
+                        cat = ttypes[col]
+                        if cat == 'number':
+                            target_cat = 'number'
+                            break
+                        if cat == 'datetime' and target_cat != 'number':
+                            target_cat = 'datetime'
+                        if cat == 'string' and target_cat not in ['number', 'datetime']:
+                            target_cat = 'string'
+                        if target_cat is None:
+                            target_cat = cat
+                if target_cat is None:
+                    target_cat = 'string'
+                union_target_types[col] = target_cat
 
-            variable = variable_obj['name']
-            data_type = variable_obj['type']
+            # Build UNION ALL CTE with aligned columns
+            union_selects = []
+            for tcfg in selected_tables:
+                tname = tcfg['name']
+                tcols = columns_per_table.get(tname) or set()
+                select_cols = ["pid", "time_point"]
+                for col in union_columns:
+                    target_cat = union_target_types.get(col, 'string')
+                    if col in tcols:
+                        if target_cat == 'number':
+                            select_cols.append(f"CAST({col} AS FLOAT) AS {col}")
+                        elif target_cat == 'datetime':
+                            select_cols.append(f"CAST({col} AS DATETIME) AS {col}")
+                        else:
+                            select_cols.append(f"CAST({col} AS NVARCHAR(MAX)) AS {col}")
+                    else:
+                        if target_cat == 'number':
+                            select_cols.append(f"CAST(NULL AS FLOAT) AS {col}")
+                        elif target_cat == 'datetime':
+                            select_cols.append(f"CAST(NULL AS DATETIME) AS {col}")
+                        else:
+                            select_cols.append(f"CAST(NULL AS NVARCHAR(MAX)) AS {col}")
+                union_selects.append(
+                    f"SELECT {', '.join(select_cols)} FROM {tname}"
+                )
 
-            if operator == 'between' and value2:
-                condition = f"t.{variable} BETWEEN ? AND ?"
-            elif operator in ['LIKE', 'NOT LIKE']:
-                condition = f"t.{variable} {operator} ?"
-            elif operator in ['IS NULL', 'IS NOT NULL']:
-                condition = f"t.{variable} {operator}"
-            else:
-                condition = f"t.{variable} {operator} ?"
-            
-            threshold_conditions_1.append(condition)
-            threshold_conditions_2.append(condition)
-
-        combined_query = """
-            WITH ParticipantGenders_1 AS (
-                SELECT 
-                    v.pid,
-                    COALESCE(p.gender, 'Unknown') as gender
-                FROM (
-                    SELECT t.pid
-                    FROM {table_name_1} t
-                    WHERE t.time_point IN ({timepoints_1})
-                    GROUP BY t.pid
-                    HAVING COUNT(DISTINCT t.time_point) = {len_timepoints_1}
-                ) v
-                LEFT JOIN {table_name_1} t ON v.pid = t.pid
-                LEFT JOIN {PARTICIPANTS_TABLE} p ON v.pid = p.pid
-                WHERE 1=1 {where_th_1}
-                GROUP BY v.pid, p.gender
-            ),
-            ParticipantGenders_2 AS (
-                SELECT 
-                    v.pid,
-                    COALESCE(p.gender, 'Unknown') as gender
-                FROM (
-                    SELECT t.pid
-                    FROM {table_name_2} t
-                    WHERE t.time_point IN ({timepoints_2})
-                    GROUP BY t.pid
-                    HAVING COUNT(DISTINCT t.time_point) = {len_timepoints_2}
-                ) v
-                LEFT JOIN {table_name_2} t ON v.pid = t.pid
-                LEFT JOIN {PARTICIPANTS_TABLE} p ON v.pid = p.pid
-                WHERE 1=1 {where_th_2}
-                GROUP BY v.pid, p.gender
-            )
-            SELECT 
-                COUNT(DISTINCT pid) as count,
-                '{type_1}' as source,
-                SUM(CASE WHEN gender IN ('M', 'MALE') OR LOWER(gender) = 'male' THEN 1 ELSE 0 END) as male_count,
-                SUM(CASE WHEN gender IN ('F', 'FEMALE') OR LOWER(gender) = 'female' THEN 1 ELSE 0 END) as female_count,
-                SUM(CASE 
-                    WHEN gender IS NULL THEN 0
-                    WHEN gender NOT IN ('M', 'MALE', 'F', 'FEMALE') 
-                        AND LOWER(gender) NOT IN ('male', 'female') 
-                    THEN 1 
-                    ELSE 0 
-                END) as other_count
-            FROM ParticipantGenders_1
-            UNION ALL
-            SELECT 
-                COUNT(DISTINCT pid) as count,
-                '{type_2}' as source,
-                SUM(CASE WHEN gender IN ('M', 'MALE') OR LOWER(gender) = 'male' THEN 1 ELSE 0 END) as male_count,
-                SUM(CASE WHEN gender IN ('F', 'FEMALE') OR LOWER(gender) = 'female' THEN 1 ELSE 0 END) as female_count,
-                SUM(CASE 
-                    WHEN gender IS NULL THEN 0
-                    WHEN gender NOT IN ('M', 'MALE', 'F', 'FEMALE') 
-                        AND LOWER(gender) NOT IN ('male', 'female') 
-                    THEN 1 
-                    ELSE 0 
-                END) as other_count
-            FROM ParticipantGenders_2
-        """.format(
-            table_name_1=selected_tables[0]['name'],
-            table_name_2=selected_tables[1]['name'],
-            type_1=selected_tables[0]['type'],
-            type_2=selected_tables[1]['type'],
-            timepoints_1=','.join(['?' for _ in timepoints]),
-            timepoints_2=','.join(['?' for _ in timepoints]),
-            len_timepoints_1=len(timepoints),
-            len_timepoints_2=len(timepoints),
-            PARTICIPANTS_TABLE=PARTICIPANTS_TABLE,
-            where_th_1=(' AND ' + ' AND '.join(threshold_conditions_1)) if threshold_conditions_1 else '',
-            where_th_2=(' AND ' + ' AND '.join(threshold_conditions_2)) if threshold_conditions_2 else '',
-        )
-        # Create separate parameter lists for each CTE
-        params_1 = timepoint_params.copy()
-        params_2 = timepoint_params.copy()
-        
-        # Add threshold parameters for each CTE
-        for threshold in thresholds:
-            if threshold.get('variable') and threshold.get('operator') and threshold.get('value'):
-                if threshold.get('operator') == 'between' and threshold.get('value2'):
-                    params_1.extend([float(threshold['value']), float(threshold['value2'])])
-                    params_2.extend([float(threshold['value']), float(threshold['value2'])])
+            # Build CombinedData CTE aggregating per pid/time_point
+            agg_cols_list = []
+            for col in union_columns:
+                if col.lower() == 'gender':
+                    agg_cols_list.append(f"MAX(u.{col}) AS survey_gender")
                 else:
-                    value = float(threshold['value']) if threshold['value'].replace('.', '').isdigit() else threshold['value']
-                    params_1.append(value)
-                    params_2.append(value)
-        
-        # Combine parameters in the correct order
-        all_params = params_1 + params_2
+                    agg_cols_list.append(f"MAX(u.{col}) AS {col}")
+            agg_cols = ",\n                        ".join(agg_cols_list)
+            combined_query = """
+                WITH Unioned AS (
+                    {union_all}
+                ),
+                CombinedData AS (
+                    SELECT 
+                        u.pid,
+                        u.time_point,
+                        MIN(p.gender) AS gender,
+                        {agg_cols}
+                    FROM Unioned u
+                    LEFT JOIN {PARTICIPANTS_TABLE} p ON u.pid = p.pid
+                    GROUP BY u.pid, u.time_point
+                ),
+                EligiblePids AS (
+                    SELECT 
+                        cd.pid,
+                        MIN(cd.gender) AS gender
+                    FROM CombinedData cd
+                    WHERE cd.time_point IN ({timepoints}) {where_th}
+                    GROUP BY cd.pid
+                    HAVING COUNT(DISTINCT cd.time_point) = {len_timepoints}{having_not_null}
+                )
+                SELECT 
+                    COUNT(DISTINCT pid) as count,
+                    '{cohort}' as source,
+                    SUM(CASE WHEN gender IN ('M', 'MALE') OR LOWER(gender) = 'male' THEN 1 ELSE 0 END) as male_count,
+                    SUM(CASE WHEN gender IN ('F', 'FEMALE') OR LOWER(gender) = 'female' THEN 1 ELSE 0 END) as female_count,
+                    SUM(CASE 
+                        WHEN gender IS NULL THEN 0
+                        WHEN gender NOT IN ('M', 'MALE', 'F', 'FEMALE') 
+                            AND LOWER(gender) NOT IN ('male', 'female') 
+                        THEN 1 
+                        ELSE 0 
+                    END) as other_count
+                FROM EligiblePids
+            """.format(
+                union_all="\n                    UNION ALL\n                    ".join(union_selects),
+                agg_cols=agg_cols if agg_cols else "",
+                PARTICIPANTS_TABLE=PARTICIPANTS_TABLE,
+                cohort=cohort_type,
+                timepoints=','.join(['?' for _ in timepoints]),
+                len_timepoints=len(timepoints),
+                where_th='',  # thresholds below
+                having_not_null=''  # will fill below
+            )
+
+            # Build threshold conditions against CombinedData alias
+            threshold_conditions = []
+            params_merged = timepoint_params.copy()
+            for threshold in all_thresholds:
+                variable_obj = threshold.get('variable')
+                operator = threshold.get('operator')
+                value = threshold.get('value')
+                value2 = threshold.get('value2')
+                if not variable_obj or not operator:
+                    continue
+                if operator not in ['IS NULL','IS NOT NULL'] and value is None:
+                    continue
+                var_name = variable_obj.get('name')
+                if var_name not in union_columns:
+                    continue
+                vtype = variable_obj.get('type')
+                if operator == 'between' and value2 is not None:
+                    threshold_conditions.append(f"cd.{var_name} BETWEEN ? AND ?")
+                    if vtype == 'number':
+                        params_merged.extend([float(value), float(value2)])
+                    else:
+                        params_merged.extend([value, value2])
+                elif operator in ['LIKE', 'NOT LIKE']:
+                    threshold_conditions.append(f"cd.{var_name} {operator} ?")
+                    params_merged.append(f"%{value}%")
+                elif operator in ['IS NULL', 'IS NOT NULL']:
+                    threshold_conditions.append(f"cd.{var_name} {operator}")
+                else:
+                    threshold_conditions.append(f"cd.{var_name} {operator} ?")
+                    if vtype == 'number':
+                        params_merged.append(float(value))
+                    else:
+                        params_merged.append(value)
+
+            # Inject thresholds into WHERE
+            if threshold_conditions:
+                combined_query = combined_query.replace("{where_th}", " AND " + " AND ".join(threshold_conditions))
+            else:
+                combined_query = combined_query.replace("{where_th}", "")
+
+            # Build NOT NULL having clause for selected variables present in union
+            selected_vars = [v for v in all_variables if isinstance(v, dict) and v.get('cohort') == cohort_type and v.get('name') in union_columns]
+            if selected_vars:
+                not_null_conditions = " AND ".join([f"cd.{v['name']} IS NOT NULL" for v in selected_vars])
+                having_clause = f" AND COUNT(CASE WHEN {not_null_conditions} THEN 1 END) = {len(timepoints)}"
+                combined_query = combined_query.replace("{having_not_null}", having_clause)
+            else:
+                combined_query = combined_query.replace("{having_not_null}", "")
+
+            combined_query = combined_query.replace("{where_th}", "")
+            queries = [combined_query]
+            all_params = params_merged
+        else:
+            # Fallback: keep prior per-table queries as-is
+            combined_query = " UNION ALL ".join(queries)
+            queries = [combined_query]
     else:
         combined_query = queries[0]
 
@@ -483,6 +721,21 @@ def query_data():
     """Execute queries based on filter parameters and return counts"""
     try:
         filters = request.json.get('filters', [])
+        # Enforce: logicParameters are required and must specify at least one constraint
+        if not isinstance(filters, list) or len(filters) == 0:
+            return jsonify({'status': 'error', 'message': 'At least one filter with logicParameters is required'}), 400
+
+        for f in filters:
+            logic_parameters = f.get('logicParameters') if isinstance(f, dict) else None
+            if not logic_parameters or len(logic_parameters) == 0:
+                return jsonify({'status': 'error', 'message': 'logicParameters are required for each filter'}), 400
+            lp0 = logic_parameters[0] if isinstance(logic_parameters[0], dict) else {}
+            has_timepoints = bool(lp0.get('timepoints'))
+            has_thresholds = bool(lp0.get('thresholds'))
+            has_cohorts = bool(lp0.get('cohorts'))
+            has_variables = bool(lp0.get('variables'))
+            if not (has_timepoints or has_thresholds or has_cohorts or has_variables):
+                return jsonify({'status': 'error', 'message': 'logicParameters must include timepoints, cohorts, thresholds, or variables'}), 400
         
         # Get database connection
         conn = get_db_connection()
@@ -500,97 +753,6 @@ def query_data():
             if not modality:
                 continue
 
-            # If no logic parameters or all fields in logic parameter are empty, just get basic counts
-            if not logic_parameters or (
-                len(logic_parameters) == 1 and
-                not logic_parameters[0].get('timepoints') and
-                not logic_parameters[0].get('thresholds') and
-                not logic_parameters[0].get('cohorts') and
-                not logic_parameters[0].get('variables')
-            ):
-                counts = {
-                    'total': 0,
-                    'children': 0,
-                    'adults': 0,
-                    'gender': {
-                        'children': {'M': 0, 'F': 0},
-                        'adults': {'M': 0, 'F': 0}
-                    }
-                }
-                
-                # Get counts for each table in this modality
-                for table_config in MODALITY_MAPPING[modality]['tables']:
-                    table_name = table_config['name']
-                    table_type = table_config['type']
-                    
-                    try:
-                        # Get total count and gender counts for this table
-                        gender_col = table_config['gender_column']
-                        base_select = """
-                            SELECT 
-                                COUNT(pid) as total,
-                                SUM(CASE WHEN gender IN ('M', 'MALE') OR LOWER(gender) = 'male' THEN 1 ELSE 0 END) as male_count,
-                                SUM(CASE WHEN gender IN ('F', 'FEMALE') OR LOWER(gender) = 'female' THEN 1 ELSE 0 END) as female_count,
-                                SUM(CASE 
-                                    WHEN gender IS NULL THEN 0
-                                    WHEN gender NOT IN ('M', 'MALE', 'F', 'FEMALE') 
-                                        AND LOWER(gender) NOT IN ('male', 'female') 
-                                    THEN 1 
-                                    ELSE 0 
-                                END) as other_count
-                            FROM TimePointCounts
-                        """
-                        
-                        # Choose query based on whether we need to get gender from participants table
-                        if gender_col == '':
-                            count_query = f"""
-                                WITH TimePointCounts AS (
-                                    SELECT 
-                                        t.pid,
-                                        COUNT(DISTINCT t.time_point) as tp_count,
-                                        MIN(p.gender) as gender
-                                    FROM {table_name} t
-                                    LEFT JOIN {PARTICIPANTS_TABLE} p ON t.pid = p.pid
-                                    WHERE t.time_point IN (1,2,3,4,5,6)
-                                    GROUP BY t.pid
-                                    HAVING COUNT(DISTINCT t.time_point) = 6  -- All timepoints required in this case
-                                )
-                                {base_select}
-                            """
-                        else:
-                            count_query = f"""
-                                WITH TimePointCounts AS (
-                                    SELECT 
-                                        pid,
-                                        COUNT(DISTINCT time_point) as tp_count,
-                                        MIN({gender_col}) as gender
-                                    FROM {table_name}
-                                    WHERE time_point IN (1,2,3,4,5,6)
-                                    GROUP BY pid
-                                    HAVING COUNT(DISTINCT time_point) = 6  -- All timepoints required in this case
-                                )
-                                {base_select}
-                            """
-                        cursor.execute(count_query)
-                        row = cursor.fetchone()
-                        count = row[0]
-                        male_count = row[1] or 0  # Use 0 if NULL
-                        female_count = row[2] or 0  # Use 0 if NULL
-                        other_count = row[3] or 0  # Use 0 if NULL
-                        
-                        # Update counts
-                        counts[table_type] = count
-                        counts['total'] += count
-                        counts['gender'][table_type]['M'] = male_count
-                        counts['gender'][table_type]['F'] = female_count
-                        counts['gender'][table_type]['O'] = other_count
-                        
-                    except pyodbc.Error as e:
-                        print(f"Error counting rows in {table_name}: {e}")
-                
-                results[modality] = {
-                    'counts': counts
-                }
             else:
                 # Original logic for when there are logic parameters
                 query, params = build_filter_queries(modality, logic_parameters)

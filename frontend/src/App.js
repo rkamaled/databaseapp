@@ -58,11 +58,13 @@ function App() {
       <header className="app-header">
         <div className="header-content">
           <div className="logo-section">
-            <img src={logo} alt="Database Viewer Logo" className="header-logo" />
+            <a href="https://guelphfamilyhealthstudy.com/" target="_blank" rel="noopener noreferrer">
+              <img src={logo} alt="Database Viewer Logo" className="header-logo" />
+            </a>
           </div>
           <div className="header-text">
             <h1>GFHS Database Viewer</h1>
-            <p>Filter and view your data with filtering system</p>
+            <p>Filter and view data with filtering system</p>
           </div>
           <button 
             className={`theme-toggle ${isDarkMode ? 'dark' : 'light'}`} 

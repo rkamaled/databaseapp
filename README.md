@@ -4,17 +4,46 @@ This guide provides instructions for setting up and running both the frontend an
 
 ## System Requirements
 
-### For Windows:
-- Node.js 18.x or higher
-- Python 3.x
-- npm (comes with Node.js)
-- Git (optional, for version control)
+### Required Software Downloads
 
-### For macOS:
+#### For Windows:
 - Node.js 18.x or higher
+  - Download from: [Node.js Official Website](https://nodejs.org/)
+  - Choose the "LTS" (Long Term Support) version
+  - npm (Node Package Manager) will be automatically installed with Node.js
 - Python 3.x
-- npm (comes with Node.js)
+  - Download from: [Python Official Website](https://www.python.org/downloads/)
+  - Important: During installation, check the box that says "Add Python to PATH"
 - Git (optional, for version control)
+  - Download from: [Git for Windows](https://gitforwindows.org/)
+
+#### For macOS:
+- Node.js 18.x or higher
+  - Download from: [Node.js Official Website](https://nodejs.org/)
+  - Choose the "LTS" (Long Term Support) version
+  - npm (Node Package Manager) will be automatically installed with Node.js
+  - Alternatively, install using Homebrew:
+    ```bash
+    brew install node
+    ```
+- Python 3.x
+  - Download from: [Python Official Website](https://www.python.org/downloads/)
+  - Alternatively, install using Homebrew:
+    ```bash
+    brew install python
+    ```
+- Git (optional, for version control)
+  - macOS usually comes with Git pre-installed
+  - If needed, download from: [Git Official Website](https://git-scm.com/download/mac)
+  - Or install using Homebrew:
+    ```bash
+    brew install git
+    ```
+
+#### Installing Homebrew (for macOS users):
+If you want to use Homebrew for installation (recommended for macOS):
+1. Visit [Homebrew Website](https://brew.sh/)
+2. Copy and paste the installation command from the website into your Terminal
 
 ## Installation Steps
 

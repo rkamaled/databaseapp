@@ -112,7 +112,7 @@ Open the main folder(DATABASEAPP) in terminal and run the following command:
    python3 start_app.py
    ```
  
-the Appshould now openin your browser!
+the App should now open in your browser!
 
 Dont forget to connect to vpn also!
  

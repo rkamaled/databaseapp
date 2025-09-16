@@ -1,7 +1,13 @@
 # Database Application Setup Guide
  
 This guide provides instructions for setting up and running both the frontend and backend components of the Database Application.
- 
+## Get the code
+
+- clone the repo into any folder by opening a terminal in your desired folder and pasting 
+    ```bash
+    git clone https://github.com/rkamaled/databaseapp.git
+    ```
+
 ## System Requirements
  
 ### Required Software Downloads
@@ -31,13 +37,6 @@ This guide provides instructions for setting up and running both the frontend an
   - Alternatively, install using Homebrew:
     ```bash
     brew install python
-    ```
-- Git
-  - macOS usually comes with Git pre-installed
-  - If needed, download from: [Git Official Website](https://git-scm.com/download/mac)
-  - Or install using Homebrew:
-    ```bash
-    brew install git
     ```
  
 #### Installing Homebrew (for macOS users):
@@ -107,12 +106,13 @@ DB_DRIVER=ODBC Driver 17 for SQL Server
 ## Running the Application
  
  
-Open the main folder(DATABASEAPP) interminaland run the following command:
+Open the main folder(DATABASEAPP) in terminal and run the following command:
  
    ```bash
    python3 start_app.py
    ```
  
 the Appshould now openin your browser!
+
 Dont forget to connect to vpn also!
  

@@ -415,6 +415,17 @@ const FilterSection = ({ onSearch }) => {
 
                       {/* Variables Selection */}
                       <div className="param-group">
+
+                      {/* Zach - Include UI elements specific for genetic modality when modality === genetics, as it is unique compared to the rest of the modalities and requires the text input drop down.
+                      
+                      - use "snp_input" as the logic param for this, as I've named it this in the query_data function in main app.py
+                      
+                      */}
+
+
+
+
+
                         <label>Variables:</label>
                         <div className="variable-search-container">
                           <input

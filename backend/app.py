@@ -4,6 +4,9 @@ import pyodbc
 from dotenv import load_dotenv
 import os
 
+#import genetic query module for functions (used in query_data at the end)
+import gen_query as genQ
+
 # Load environment variables
 load_dotenv()
 
@@ -48,13 +51,15 @@ MODALITY_MAPPING = {
         'tables': [
             {'name': 'life_labs_2025', 'type': 'both', "gender_column": ""},
         ]
-    }
+    },
     
-    # 'Genotype Data': {
-    #     'tables': [
-    #         {'name': 'genotype_data_2025', 'type': '*', "gender_column": ""},
-    #     ]
-    # }
+
+    #assuming this will need this to say type is both here? Zach
+    'Genotype Data': {
+        'tables': [
+            {'name': 'genotype_data_2025', 'type': 'both', "gender_column": ""},
+        ]
+     }
 }
 
 def get_db_connection():
@@ -194,6 +199,15 @@ def get_variables(modality, cohort_type):
         cursor.close()
         conn.close()
 
+        #for genetic data, we don't want to return columns to front end - because this is participants and we are not filtering based on participants. Instead we want them to be able to search for text in the "manifest_name" column, but we can't return this for a drop down menu because there are 2 million of them. Instead we want to render an input text box for this and query from there. 
+
+        #So we can perhaps have this conditional logic for genotype modality and communicate this to the UI accordingly
+        if modality == "Genotype Data":
+            return jsonify({
+                'status': 'success',
+                'variables': []
+            })
+
         return jsonify({
             'status': 'success',
             'variables': sorted([v for v in variables.values()], key=lambda x: x['name'])
@@ -324,9 +338,49 @@ def build_filter_queries(modality, logic_parameters):
         timepoints = logic_param.get('timepoints') if logic_param and logic_param.get('timepoints') else []
         thresholds = logic_param.get('thresholds') if logic_param and logic_param.get('thresholds') else []
         cohorts = logic_param.get('cohorts') if logic_param and logic_param.get('cohorts') else []
+
+        #Zach: introducing genetic specific logic which doesn't follow the same as other modalities 
+        if modality == "genetic":
+            variables_for_table = ['manifest_name', "possible_rsids"] #we can hardcode these becauser they aren't selected by user - always the same for genetics
+
+            snp_list = logic_param.get('snp_input') if logic_param and logic_param.get('snp_input') else []
+            
+            if snp_list:
+                placeholders = ','.join(['?' for _ in snp_list])
+                
+                # exact manifest_name match
+                query = f"SELECT * FROM {table_name} WHERE manifest_name IN ({placeholders});"
+                query_params = snp_list.copy()
+                
+                # possible_rsids match
+                possible_conditions = " OR ".join([
+                    f"EXISTS (SELECT 1 FROM STRING_SPLIT(possible_rsids, ';') AS s WHERE s.value = ?)"
+                    for _ in snp_list
+                ])
+                possible_query = f"""
+                    SELECT * 
+                    FROM {table_name} 
+                    WHERE ({possible_conditions}) 
+                    AND manifest_name NOT IN ({placeholders});
+                """
+                possible_params = snp_list.copy() + snp_list.copy()  # first for EXISTS, second for NOT IN
+
+                queries.append(query)
+                all_params.extend(query_params)
+                
+                if possible_query:
+                    queries.append(possible_query)
+                    all_params.extend(possible_params)
+            else:
+                query = None
+                possible_query = None
+
+
         # Variables scoped to the current table's cohort and membership
         # For 'both' type tables, include variables for both 'adults' and 'children' cohorts
+        
         if table_type == 'both':
+
             variables_for_table = []
             for var in (logic_param.get('variables') or []):
                 if not isinstance(var, dict):
@@ -734,6 +788,7 @@ def query_data():
             has_thresholds = bool(lp0.get('thresholds'))
             has_cohorts = bool(lp0.get('cohorts'))
             has_variables = bool(lp0.get('variables'))
+
             if not (has_timepoints or has_thresholds or has_cohorts or has_variables):
                 return jsonify({'status': 'error', 'message': 'logicParameters must include timepoints, cohorts, thresholds, or variables'}), 400
         
@@ -759,6 +814,7 @@ def query_data():
                 try:
                     cursor.execute(query, params)
                     rows = cursor.fetchall()
+
                     counts = {
                         'total': 0,
                         'children': 0,
@@ -769,27 +825,63 @@ def query_data():
                         }
                     }
                     
-                    for row in rows:
-                        if row and len(row) >= 5:  # count, source, male_count, female_count, other_count
-                            count = row[0] or 0  # Use 0 if count is None
-                            source = row[1]
-                            male_count = row[2] or 0
-                            female_count = row[3] or 0
-                            other_count = row[4] or 0
-                            
-                            # Normalize source type to match our expected keys
-                            source_type = source.lower()  # Convert to lowercase to handle any case variations
-                            if source_type in ['children', 'adults']:  # Make sure it's a valid source type
-                                counts[source_type] = count
-                                counts['total'] += count
-                                counts['gender'][source_type]['M'] = male_count
-                                counts['gender'][source_type]['F'] = female_count
-                                counts['gender'][source_type]['O'] = other_count
+                    if modality == "genetic":
+
+                        import pandas as pd
+
+                        #Zach: run the genetic_query function from gen_query module.
+                        cols = [column[0] for column in cursor.description]
+                        df_genetic = pd.DataFrame.from_records(rows, columns=cols)
+
+                        #will need this to map possible_rsids to the desired ones for display in later applications (beyond basic counts) - when we make tables of rsids and genotype group counts.
+                        snp_list = logic_parameters[0].get('snp_list')
+
+                        #Zach: run the genetic_query function from gen_query module.
+                        adult_genetic, child_genetic = genQ.genetic_query(df_genetic, snp_list)
+
+                        #### -----
+
+                        #code here to map genders for this using pid column of above dataframes
+
+                        #probably should also ensure rows here are > 5 as well
+
+                        #### -----
+
+                        counts = {
+                            'total': len(adult_genetic) + len(child_genetic),
+                            'children': len(child_genetic),
+                            'adults': len(adult_genetic),
+                            'gender': {
+                                'children': {'M': 0, 'F': 0, 'O': 0},
+                                'adults': {'M': 0, 'F': 0, 'O': 0}
+                            }
+                        }
+
+                    else:
+                        
+                        for row in rows:
+                            if row and len(row) >= 5:  # count, source, male_count, female_count, other_count
+                                count = row[0] or 0  # Use 0 if count is None
+                                source = row[1]
+                                male_count = row[2] or 0
+                                female_count = row[3] or 0
+                                other_count = row[4] or 0
+                                
+                                # Normalize source type to match our expected keys
+                                source_type = source.lower()  # Convert to lowercase to handle any case variations
+                                if source_type in ['children', 'adults']:  # Make sure it's a valid source type
+                                    counts[source_type] = count
+                                    counts['total'] += count
+                                    counts['gender'][source_type]['M'] = male_count
+                                    counts['gender'][source_type]['F'] = female_count
+                                    counts['gender'][source_type]['O'] = other_count
                     
+
                     results[modality] = {
                         'counts': counts,
                         'query': query
                     }
+
                 except pyodbc.Error as e:
                     results[modality] = {
                         'error': str(e),

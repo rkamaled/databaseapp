@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 import os
 
 #import genetic query module for functions (used in query_data at the end)
-import gen_query as genQ
+import genetics_process as gPro
 
 # Load environment variables
 load_dotenv()
@@ -340,6 +340,12 @@ def build_filter_queries(modality, logic_parameters):
         cohorts = logic_param.get('cohorts') if logic_param and logic_param.get('cohorts') else []
 
         #Zach: introducing genetic specific logic which doesn't follow the same as other modalities 
+
+        '''
+        Zach: Im not sure this will work right off the bat - but hopefully it does.
+        
+        '''
+
         if modality == "genetic":
             variables_for_table = ['manifest_name', "possible_rsids"] #we can hardcode these becauser they aren't selected by user - always the same for genetics
 
@@ -348,11 +354,11 @@ def build_filter_queries(modality, logic_parameters):
             if snp_list:
                 placeholders = ','.join(['?' for _ in snp_list])
                 
-                # exact manifest_name match
+                #exact manifest_name match
                 query = f"SELECT * FROM {table_name} WHERE manifest_name IN ({placeholders});"
                 query_params = snp_list.copy()
                 
-                # possible_rsids match
+                #possible_rsids match
                 possible_conditions = " OR ".join([
                     f"EXISTS (SELECT 1 FROM STRING_SPLIT(possible_rsids, ';') AS s WHERE s.value = ?)"
                     for _ in snp_list
@@ -363,11 +369,11 @@ def build_filter_queries(modality, logic_parameters):
                     WHERE ({possible_conditions}) 
                     AND manifest_name NOT IN ({placeholders});
                 """
-                possible_params = snp_list.copy() + snp_list.copy()  # first for EXISTS, second for NOT IN
+                possible_params = snp_list.copy() + snp_list.copy()  
 
                 queries.append(query)
                 all_params.extend(query_params)
-                
+            
                 if possible_query:
                     queries.append(possible_query)
                     all_params.extend(possible_params)
@@ -829,6 +835,15 @@ def query_data():
 
                         import pandas as pd
 
+                        '''
+                        The object returned above will lack gender counts - we will need to map pids to sex and count for m/f before passing to front end. I'm not sure which table this should be mapped to from the db - but will need help with that part.
+
+                        '''
+
+                        #------------------------------------------------------------------------------------------------------------
+                        # ZACH: Hoping that the method for accessing the df from the query below will work, and same for the snp_list parameter passed in from the front end. Will need help to ensure this is coming in as an appropriate list object for the rest of the functions to work.
+                        #------------------------------------------------------------------------------------------------------------
+
                         #Zach: run the genetic_query function from gen_query module.
                         cols = [column[0] for column in cursor.description]
                         df_genetic = pd.DataFrame.from_records(rows, columns=cols)
@@ -836,26 +851,49 @@ def query_data():
                         #will need this to map possible_rsids to the desired ones for display in later applications (beyond basic counts) - when we make tables of rsids and genotype group counts.
                         snp_list = logic_parameters[0].get('snp_list')
 
-                        #Zach: run the genetic_query function from gen_query module.
-                        adult_genetic, child_genetic = genQ.genetic_query(df_genetic, snp_list)
+                        #------------------------------------------------------------------------------------------------------------
 
-                        #### -----
+
+                        #run some functions to work with the queried genetic data. Note match types is just a dict that indicates if each SNP weas exact or from the possible_matches.
+                        sample_query_df, match_types = gPro.clean_genetic_query(df_genetic, snp_list)
+
+                        #Step 2. Split adults vs children based on pid string starts
+                        adult_df = sample_query_df[sample_query_df['pid'].str.startswith(('p', 's'))]
+                        child_df = sample_query_df[sample_query_df['pid'].str.startswith(('a', 'b', 'c'))]
+
+                        ### ****--------------------------------------------------------------------
+
+                        '''ZACH
+
+                        NOTE: The function calls below are to generate a table of STATS for each SNP in both children and adults - and would be separate from standard sample size counts as is happening for other modalities for the database web app. For now, these can be dis-regarded and even commented out - however, eventually this would be useful as an additional two tables to print beneath the main sample size table returned.
+
+                        '''
+
+                        #Step 3. Process each cohort into table of STATs with one row per SNP
+                        snp_stats_adult = gPro.cohort_snp_stats(adult_df, snp_list)  
+                        snp_stats_child = gPro.cohort_snp_stats(child_df, snp_list)
+
+                        #Step 4. Add warnings based on common genetic criteria
+                        snp_stats_adult = gPro.add_warnings(snp_stats_adult)
+                        snp_stats_child = gPro.add_warnings(snp_stats_child)
+      
+                        #--------------------------------------------------------------------
+                        #ZACH: THIS GIVES US THE MAIN SAMPLE SIZE COUNTS:
+                        #--------------------------------------------------------------------
+                        sample_size_counts = gPro.complete_record_count(adult_df, child_df, snp_list)
+
+                        '''
+                        The object returned above will lack gender counts - we will need to map pids to sex and count for m/f before passing to front end. I'm not sure which table this should be mapped to from the db - but will need help with that part.
+
+                        '''
+
+                        #--------------------------------------------------------------------
 
                         #code here to map genders for this using pid column of above dataframes
 
-                        #probably should also ensure rows here are > 5 as well
+                        #probably should also ensure rows here are > 5 as well!!
 
                         #### -----
-
-                        counts = {
-                            'total': len(adult_genetic) + len(child_genetic),
-                            'children': len(child_genetic),
-                            'adults': len(adult_genetic),
-                            'gender': {
-                                'children': {'M': 0, 'F': 0, 'O': 0},
-                                'adults': {'M': 0, 'F': 0, 'O': 0}
-                            }
-                        }
 
                     else:
                         

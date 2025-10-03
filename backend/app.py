@@ -716,6 +716,331 @@ def build_filter_queries(modality, logic_parameters):
 
     return combined_query, all_params
 
+def build_filter_pid_query(modality, logic_parameters):
+    """Build a SQL query that returns DISTINCT pid and gender eligible for this filter."""
+    modality_config = MODALITY_MAPPING.get(modality)
+    if not modality_config:
+        raise ValueError(f"No table mapping found for modality: {modality}")
+
+    # Determine selected tables based on cohorts
+    selected_tables = []
+    selected_cohorts = []
+    if logic_parameters and len(logic_parameters) > 0:
+        selected_cohorts = logic_parameters[0].get('cohorts', [])
+    has_children = 'children' in selected_cohorts
+    has_adults = 'adults' in selected_cohorts or 'adult' in selected_cohorts
+    if not selected_cohorts or (has_children and has_adults):
+        selected_tables = modality_config['tables'].copy()
+    else:
+        for table_config in modality_config['tables']:
+            table_type = table_config['type']
+            if (table_type == 'children' and has_children) or \
+               (table_type == 'adults' and has_adults) or \
+               (table_type == 'both' and (has_children or has_adults)):
+                selected_tables.append(table_config)
+
+    # Discover columns for variable/threshold scoping
+    columns_per_table = {}
+    try:
+        conn_cols = get_db_connection()
+        if conn_cols:
+            cur_cols = conn_cols.cursor()
+            for table_cfg in selected_tables:
+                tname = table_cfg['name']
+                try:
+                    cur_cols.execute(f"SELECT TOP 0 * FROM {tname}")
+                    col_names = set()
+                    for col in cur_cols.description:
+                        col_names.add(col[0])
+                    columns_per_table[tname] = col_names
+                except Exception:
+                    columns_per_table[tname] = set()
+            cur_cols.close()
+            conn_cols.close()
+    except Exception:
+        pass
+
+    subselects = []
+    all_params = []
+
+    for table_config in selected_tables:
+        table_name = table_config['name']
+        table_type = table_config['type']
+
+        logic_param = logic_parameters[0] if logic_parameters and len(logic_parameters) > 0 else {}
+        timepoints = logic_param.get('timepoints') if logic_param and logic_param.get('timepoints') else []
+        thresholds = logic_param.get('thresholds') if logic_param and logic_param.get('thresholds') else []
+
+        # Variables present on this table for NOT NULL checks
+        if table_type == 'both':
+            variables_for_table = []
+            for var in (logic_param.get('variables') or []):
+                if not isinstance(var, dict):
+                    continue
+                if var.get('cohort') not in ['adults', 'children', 'both']:
+                    continue
+                var_name = var.get('name')
+                var_tables = var.get('tables') if isinstance(var.get('tables'), list) else None
+                if var_tables:
+                    has_column = table_name in var_tables
+                else:
+                    table_cols = columns_per_table.get(table_name)
+                    has_column = (var_name in table_cols) if isinstance(table_cols, set) else True
+                if has_column:
+                    variables_for_table.append(var)
+        else:
+            variables_for_table = []
+            for var in (logic_param.get('variables') or []):
+                if not isinstance(var, dict):
+                    continue
+                if var.get('cohort') != table_type:
+                    continue
+                var_name = var.get('name')
+                var_tables = var.get('tables') if isinstance(var.get('tables'), list) else None
+                if var_tables:
+                    has_column = table_name in var_tables
+                else:
+                    table_cols = columns_per_table.get(table_name)
+                    has_column = (var_name in table_cols) if isinstance(table_cols, set) else True
+                if has_column:
+                    variables_for_table.append(var)
+
+        # Timepoints
+        if not timepoints or timepoints == [] or 'all' in timepoints:
+            timepoints = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+        timepoint_params = [int(tp) for tp in timepoints]
+
+        having_not_null_clause_single = (
+            f" AND COUNT(CASE WHEN {_build_not_null_conditions(variables_for_table)} THEN 1 END) = {len(timepoints)}"
+            if variables_for_table else ""
+        )
+
+        pid_filter_condition = _build_pid_filter_conditions(table_type, selected_cohorts)
+
+        # Threshold conditions
+        threshold_conditions = []
+        params = timepoint_params.copy()
+        for threshold in thresholds:
+            variable_obj = threshold.get('variable')
+            operator = threshold.get('operator')
+            value = threshold.get('value')
+            value2 = threshold.get('value2')
+            if not variable_obj or not operator:
+                continue
+            if operator not in ['IS NULL','IS NOT NULL'] and value is None:
+                continue
+            variable = variable_obj['name']
+            data_type = variable_obj['type']
+            if operator == 'between' and value2 is not None:
+                threshold_conditions.append(f"t.{variable} BETWEEN ? AND ?")
+                if data_type == 'number':
+                    params.extend([float(value), float(value2)])
+                else:
+                    params.extend([value, value2])
+            elif operator in ['LIKE', 'NOT LIKE']:
+                threshold_conditions.append(f"t.{variable} {operator} ?")
+                params.append(f"%{value}%")
+            elif operator in ['IS NULL', 'IS NOT NULL']:
+                threshold_conditions.append(f"t.{variable} {operator}")
+            else:
+                threshold_conditions.append(f"t.{variable} {operator} ?")
+                if data_type == 'number':
+                    params.append(float(value))
+                else:
+                    params.append(value)
+
+        thresholds_sql = (" AND " + " AND ".join(threshold_conditions)) if threshold_conditions else ""
+
+        # Build per-table subselect of eligible PIDs
+        subselect = f"""
+            SELECT t.pid
+            FROM {table_name} t
+            WHERE t.time_point IN ({','.join(['?' for _ in timepoints])})
+              AND {pid_filter_condition}
+              {thresholds_sql}
+            GROUP BY t.pid
+            HAVING COUNT(DISTINCT t.time_point) = {len(timepoints)}{having_not_null_clause_single}
+        """
+        subselects.append(subselect)
+        all_params.extend(params)
+
+    if not subselects:
+        return "SELECT pid, gender FROM (SELECT NULL as pid, NULL as gender) x WHERE 1=0", []
+
+    unioned = "\n            UNION ALL\n            ".join(subselects)
+    full_query = f"""
+        WITH UnionPids AS (
+            {unioned}
+        ),
+        DistinctPids AS (
+            SELECT DISTINCT pid FROM UnionPids
+        )
+        SELECT dp.pid, COALESCE(p.gender, 'Unknown') as gender
+        FROM DistinctPids dp
+        LEFT JOIN {PARTICIPANTS_TABLE} p ON dp.pid = p.pid
+    """
+    return full_query, all_params
+
+def build_filter_pid_subselect(modality, logic_parameters):
+    """Return a SQL subselect that yields DISTINCT pid for a single filter."""
+    modality_config = MODALITY_MAPPING.get(modality)
+    if not modality_config:
+        raise ValueError(f"No table mapping found for modality: {modality}")
+
+    # Determine tables for cohorts
+    selected_tables = []
+    selected_cohorts = []
+    if logic_parameters and len(logic_parameters) > 0:
+        selected_cohorts = logic_parameters[0].get('cohorts', [])
+    has_children = 'children' in selected_cohorts
+    has_adults = 'adults' in selected_cohorts or 'adult' in selected_cohorts
+    if not selected_cohorts or (has_children and has_adults):
+        selected_tables = modality_config['tables'].copy()
+    else:
+        for table_config in modality_config['tables']:
+            table_type = table_config['type']
+            if (table_type == 'children' and has_children) or \
+               (table_type == 'adults' and has_adults) or \
+               (table_type == 'both' and (has_children or has_adults)):
+                selected_tables.append(table_config)
+
+    # Discover columns for variable/threshold scoping
+    columns_per_table = {}
+    try:
+        conn_cols = get_db_connection()
+        if conn_cols:
+            cur_cols = conn_cols.cursor()
+            for table_cfg in selected_tables:
+                tname = table_cfg['name']
+                try:
+                    cur_cols.execute(f"SELECT TOP 0 * FROM {tname}")
+                    col_names = set(col[0] for col in cur_cols.description)
+                    columns_per_table[tname] = col_names
+                except Exception:
+                    columns_per_table[tname] = set()
+            cur_cols.close()
+            conn_cols.close()
+    except Exception:
+        pass
+
+    # Build union-of-tables subselects honoring thresholds and not-null variable checks
+    subselects = []
+    params_all = []
+
+    logic_param = logic_parameters[0] if logic_parameters and len(logic_parameters) > 0 else {}
+    timepoints = logic_param.get('timepoints') if logic_param and logic_param.get('timepoints') else []
+    thresholds = logic_param.get('thresholds') if logic_param and logic_param.get('thresholds') else []
+
+    # variables check per-table
+    for table_config in selected_tables:
+        table_name = table_config['name']
+        table_type = table_config['type']
+
+        # Variables present on this table for NOT NULL checks
+        if table_type == 'both':
+            variables_for_table = []
+            for var in (logic_param.get('variables') or []):
+                if not isinstance(var, dict):
+                    continue
+                if var.get('cohort') not in ['adults', 'children', 'both']:
+                    continue
+                var_name = var.get('name')
+                var_tables = var.get('tables') if isinstance(var.get('tables'), list) else None
+                if var_tables:
+                    has_column = table_name in var_tables
+                else:
+                    table_cols = columns_per_table.get(table_name)
+                    has_column = (var_name in table_cols) if isinstance(table_cols, set) else True
+                if has_column:
+                    variables_for_table.append(var)
+        else:
+            variables_for_table = []
+            for var in (logic_param.get('variables') or []):
+                if not isinstance(var, dict):
+                    continue
+                if var.get('cohort') != table_type:
+                    continue
+                var_name = var.get('name')
+                var_tables = var.get('tables') if isinstance(var.get('tables'), list) else None
+                if var_tables:
+                    has_column = table_name in var_tables
+                else:
+                    table_cols = columns_per_table.get(table_name)
+                    has_column = (var_name in table_cols) if isinstance(table_cols, set) else True
+                if has_column:
+                    variables_for_table.append(var)
+
+        # Timepoints
+        tps = timepoints
+        if not tps or tps == [] or 'all' in tps:
+            tps = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+        tp_params = [int(tp) for tp in tps]
+
+        having_not_null_clause_single = (
+            f" AND COUNT(CASE WHEN {_build_not_null_conditions(variables_for_table)} THEN 1 END) = {len(tps)}"
+            if variables_for_table else ""
+        )
+
+        pid_filter_condition = _build_pid_filter_conditions(table_type, selected_cohorts)
+
+        # Threshold conditions and params
+        th_conditions = []
+        params = tp_params.copy()
+        for threshold in thresholds or []:
+            variable_obj = threshold.get('variable')
+            operator = threshold.get('operator')
+            value = threshold.get('value')
+            value2 = threshold.get('value2')
+            if not variable_obj or not operator:
+                continue
+            if operator not in ['IS NULL','IS NOT NULL'] and value is None:
+                continue
+            variable = variable_obj['name']
+            data_type = variable_obj['type']
+            if operator == 'between' and value2 is not None:
+                th_conditions.append(f"t.{variable} BETWEEN ? AND ?")
+                if data_type == 'number':
+                    params.extend([float(value), float(value2)])
+                else:
+                    params.extend([value, value2])
+            elif operator in ['LIKE', 'NOT LIKE']:
+                th_conditions.append(f"t.{variable} {operator} ?")
+                params.append(f"%{value}%")
+            elif operator in ['IS NULL', 'IS NOT NULL']:
+                th_conditions.append(f"t.{variable} {operator}")
+            else:
+                th_conditions.append(f"t.{variable} {operator} ?")
+                if data_type == 'number':
+                    params.append(float(value))
+                else:
+                    params.append(value)
+
+        th_sql = (" AND " + " AND ".join(th_conditions)) if th_conditions else ""
+
+        subselects.append(
+            f"""
+            SELECT t.pid
+            FROM {table_name} t
+            WHERE t.time_point IN ({','.join(['?' for _ in tps])})
+              AND {pid_filter_condition}
+              {th_sql}
+            GROUP BY t.pid
+            HAVING COUNT(DISTINCT t.time_point) = {len(tps)}{having_not_null_clause_single}
+            """
+        )
+        params_all.extend(params)
+
+    if not subselects:
+        return "SELECT pid FROM (SELECT NULL as pid) x WHERE 1=0", []
+
+    unioned = "\n            UNION ALL\n            ".join(subselects)
+    pid_only_query = f"""
+        SELECT DISTINCT pid FROM (
+            {unioned}
+        ) AS U
+    """
+    return pid_only_query, params_all
+
 @app.route('/query-data', methods=['POST'])
 def query_data():
     """Execute queries based on filter parameters and return counts"""
@@ -744,8 +1069,39 @@ def query_data():
 
         cursor = conn.cursor()
         results = {}
+        filter_counts = []  # store per-filter counts for min-based combined
+
+        # Accumulator for a single combined table across all filters
+        combined_counts = {
+            'total': 0,
+            'children': 0,
+            'adults': 0,
+            'gender': {
+                'children': {'M': 0, 'F': 0, 'O': 0},
+                'adults': {'M': 0, 'F': 0, 'O': 0}
+            }
+        }
+
+        def add_counts(target, src):
+            target['total'] += int(src.get('total', 0) or 0)
+            target['children'] += int(src.get('children', 0) or 0)
+            target['adults'] += int(src.get('adults', 0) or 0)
+            # genders
+            tga = target['gender']['adults']
+            tgc = target['gender']['children']
+            sga = ((src.get('gender') or {}).get('adults')) or {'M': 0, 'F': 0, 'O': 0}
+            sgc = ((src.get('gender') or {}).get('children')) or {'M': 0, 'F': 0, 'O': 0}
+            tga['M'] += int(sga.get('M', 0) or 0)
+            tga['F'] += int(sga.get('F', 0) or 0)
+            tga['O'] += int(sga.get('O', 0) or 0)
+            tgc['M'] += int(sgc.get('M', 0) or 0)
+            tgc['F'] += int(sgc.get('F', 0) or 0)
+            tgc['O'] += int(sgc.get('O', 0) or 0)
 
         # Process each filter
+        filter_pid_sets = []  # list of dicts pid->gender per filter
+        filter_pid_queries = []
+        filter_pid_params = []
         for filter_item in filters:
             modality = filter_item.get('modality')
             logic_parameters = filter_item.get('logicParameters') or []
@@ -786,18 +1142,69 @@ def query_data():
                                 counts['gender'][source_type]['F'] = female_count
                                 counts['gender'][source_type]['O'] = other_count
                     
-                    results[modality] = {
-                        'counts': counts,
-                        'query': query
-                    }
+                    # Accumulate per-modality (avoid overwriting when same modality appears multiple times)
+                    if modality not in results:
+                        results[modality] = {
+                            'counts': {
+                                'total': 0,
+                                'children': 0,
+                                'adults': 0,
+                                'gender': {
+                                    'children': {'M': 0, 'F': 0, 'O': 0},
+                                    'adults': {'M': 0, 'F': 0, 'O': 0}
+                                }
+                            },
+                            'query': query
+                        }
+                    # Add to modality totals
+                    add_counts(results[modality]['counts'], counts)
+                    # Add to combined totals
+                    add_counts(combined_counts, counts)
+                    # Track per-filter counts for min-based combination
+                    filter_counts.append(counts)
                 except pyodbc.Error as e:
                     results[modality] = {
                         'error': str(e),
                         'query': query  # Include failed query for debugging
                     }
 
+                # Prepare PID-only subselect for SQL-level INTERSECT
+                try:
+                    pid_subselect_sql, pid_subselect_params = build_filter_pid_subselect(modality, logic_parameters)
+                    filter_pid_queries.append(pid_subselect_sql)
+                    filter_pid_params.extend(pid_subselect_params)
+                except Exception:
+                    pass
+
         cursor.close()
         conn.close()
+
+        # Compute min-based combined across filters if 2+ filters
+        if len(filter_counts) >= 2:
+            def get_val(fc, cohort, key):
+                return int((((fc.get('gender') or {}).get(cohort) or {}).get(key, 0)) or 0)
+
+            adults_m = min(get_val(fc, 'adults', 'M') for fc in filter_counts)
+            adults_f = min(get_val(fc, 'adults', 'F') for fc in filter_counts)
+            adults_o = min(get_val(fc, 'adults', 'O') for fc in filter_counts)
+            children_m = min(get_val(fc, 'children', 'M') for fc in filter_counts)
+            children_f = min(get_val(fc, 'children', 'F') for fc in filter_counts)
+            children_o = min(get_val(fc, 'children', 'O') for fc in filter_counts)
+
+            adults_total = adults_m + adults_f + adults_o
+            children_total = children_m + children_f + children_o
+            combined_min_counts = {
+                'total': adults_total + children_total,
+                'children': children_total,
+                'adults': adults_total,
+                'gender': {
+                    'children': {'M': children_m, 'F': children_f, 'O': children_o},
+                    'adults': {'M': adults_m, 'F': adults_f, 'O': adults_o}
+                }
+            }
+            results['Combined'] = { 'counts': combined_min_counts }
+
+        # Ensure Combined only reflects the min-based combined when multiple filters are used
 
         return jsonify({
             'status': 'success',

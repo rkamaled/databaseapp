@@ -44,6 +44,39 @@ If you want to use Homebrew for installation (recommended for macOS):
 1. Visit [Homebrew Website](https://brew.sh/)
 2. Copy and paste the installation command from the website into your Terminal
  
+## ODBC Driver 17 for SQL Server
+
+The backend uses `pyodbc` and requires the "ODBC Driver 17 for SQL Server".
+
+#### macOS (Homebrew)
+Run the following commands in Terminal:
+```bash
+brew update
+brew install unixodbc
+brew tap microsoft/mssql-release https://github.com/Microsoft/homebrew-mssql-release
+ACCEPT_EULA=Y brew install msodbcsql17
+```
+
+#### Windows
+Download and install from Microsoft:
+- [Download ODBC Driver for SQL Server (Windows)](https://learn.microsoft.com/sql/connect/odbc/download-odbc-driver-for-sql-server)
+
+On that page, choose Windows and select the installer for "ODBC Driver 17 for SQL Server", then run the `.msi` and follow the prompts.
+ 
+#### Verify installation
+
+macOS:
+```bash
+odbcinst -q -d
+```
+
+Windows (PowerShell):
+```powershell
+Get-OdbcDriver | Where-Object Name -like "*ODBC Driver 17*"
+```
+
+If the command prints a matching entry, the driver is installed. If it prints an empty list or nothing, the driver is not detected.
+ 
 ## Installation Steps
  
 ### 1. Backend Setup
@@ -94,19 +127,20 @@ If you want to use Homebrew for installation (recommended for macOS):
 Setup database connection file:
 go to backend folder and create a file called ".env"
 then paste the db credentials:
- 
-DB_SERVER=msdatatest2022.cfs.uoguelph.ca
-DB_DATABASE=GFHS_PSDB
-DB_USERNAME=gfhsUser
-DB_PASSWORD= *
-DB_DRIVER=ODBC Driver 17 for SQL Server
+   ```bash
+   DB_SERVER=msdatatest2022.cfs.uoguelph.ca
+   DB_DATABASE=GFHS_PSDB
+   DB_USERNAME=gfhsUser
+   DB_PASSWORD= *
+   DB_DRIVER=ODBC Driver 17 for SQL Server
+   ```
+
  
 *put password for DB in password variable
  
 ## Running the Application
  
- 
-Open the main folder(DATABASEAPP) in terminal and run the following command:
+Connect to vpn the open the main folder(DATABASEAPP) in terminal and run the following command:
  
    ```bash
    python3 start_app.py
@@ -114,5 +148,13 @@ Open the main folder(DATABASEAPP) in terminal and run the following command:
  
 the App should now open in your browser!
 
-Dont forget to connect to vpn also!
+
+## Fetching New Updates from Github
+
+- Fetch latest updates from the repo by opening the terminal in the DATABASEAPP folder and run the following:
+    ```bash
+   git reset --hard
+   git fetch origin
+    ```
+
  

@@ -1176,35 +1176,129 @@ def query_data():
                 except Exception:
                     pass
 
+        # Compute true intersection via SQL INTERSECT when 2+ filters
+        intersection_counts = {
+            'total': 0,
+            'children': 0,
+            'adults': 0,
+            'gender': {
+                'children': {'M': 0, 'F': 0, 'O': 0},
+                'adults': {'M': 0, 'F': 0, 'O': 0}
+            }
+        }
+        if len(filter_pid_queries) >= 2:
+            try:
+                intersect_sql = " INTERSECT ".join([f"({q})" for q in filter_pid_queries])
+                full_sql = f"""
+                    WITH Intersected AS (
+                        {intersect_sql}
+                    )
+                    SELECT 
+                        COUNT(*) as total,
+                        SUM(CASE WHEN UPPER(LEFT(pid, 1)) IN ('P', 'S') THEN 1 ELSE 0 END) as adults,
+                        SUM(CASE WHEN UPPER(LEFT(pid, 1)) IN ('A', 'B', 'C') THEN 1 ELSE 0 END) as children,
+                        SUM(CASE WHEN UPPER(LEFT(pid, 1)) IN ('P', 'S') AND (p.gender IN ('M','MALE') OR LOWER(p.gender)='male') THEN 1 ELSE 0 END) as adults_m,
+                        SUM(CASE WHEN UPPER(LEFT(pid, 1)) IN ('P', 'S') AND (p.gender IN ('F','FEMALE') OR LOWER(p.gender)='female') THEN 1 ELSE 0 END) as adults_f,
+                        SUM(CASE WHEN UPPER(LEFT(pid, 1)) IN ('P', 'S') AND p.gender IS NOT NULL AND p.gender NOT IN ('M','MALE','F','FEMALE') AND LOWER(p.gender) NOT IN ('male','female') THEN 1 ELSE 0 END) as adults_o,
+                        SUM(CASE WHEN UPPER(LEFT(pid, 1)) IN ('A', 'B', 'C') AND (p.gender IN ('M','MALE') OR LOWER(p.gender)='male') THEN 1 ELSE 0 END) as children_m,
+                        SUM(CASE WHEN UPPER(LEFT(pid, 1)) IN ('A', 'B', 'C') AND (p.gender IN ('F','FEMALE') OR LOWER(p.gender)='female') THEN 1 ELSE 0 END) as children_f,
+                        SUM(CASE WHEN UPPER(LEFT(pid, 1)) IN ('A', 'B', 'C') AND p.gender IS NOT NULL AND p.gender NOT IN ('M','MALE','F','FEMALE') AND LOWER(p.gender) NOT IN ('male','female') THEN 1 ELSE 0 END) as children_o
+                    FROM Intersected i
+                    LEFT JOIN {PARTICIPANTS_TABLE} p ON i.pid = p.pid
+                """
+                cursor.execute(full_sql, filter_pid_params)
+                row = cursor.fetchone()
+                if row:
+                    intersection_counts['total'] = int(row[0] or 0)
+                    intersection_counts['adults'] = int(row[1] or 0)
+                    intersection_counts['children'] = int(row[2] or 0)
+                    intersection_counts['gender']['adults']['M'] = int(row[3] or 0)
+                    intersection_counts['gender']['adults']['F'] = int(row[4] or 0)
+                    intersection_counts['gender']['adults']['O'] = int(row[5] or 0)
+                    intersection_counts['gender']['children']['M'] = int(row[6] or 0)
+                    intersection_counts['gender']['children']['F'] = int(row[7] or 0)
+                    intersection_counts['gender']['children']['O'] = int(row[8] or 0)
+            except Exception:
+                pass
+
+        # Fallback to Python-side intersection if SQL result is zero but per-filter sets are non-empty
+        try:
+            if intersection_counts['total'] == 0 and len(filters) >= 2:
+                pid_sets = []
+                gender_map = {}
+                for filter_item in filters:
+                    modality = filter_item.get('modality')
+                    logic_parameters = filter_item.get('logicParameters') or []
+                    if not modality:
+                        continue
+                    pid_query_full, pid_params_full = build_filter_pid_query(modality, logic_parameters)
+                    cursor.execute(pid_query_full, pid_params_full)
+                    rows = cursor.fetchall()
+                    s = set()
+                    for r in rows:
+                        if r and len(r) >= 2 and r[0] is not None:
+                            pid = str(r[0])
+                            s.add(pid)
+                            if pid not in gender_map:
+                                gender_map[pid] = r[1]
+                    if s:
+                        pid_sets.append(s)
+                if len(pid_sets) >= 2:
+                    inter = set.intersection(*pid_sets)
+                else:
+                    inter = set()
+
+                def cohort_from_pid(pid_value):
+                    if not pid_value:
+                        return 'other'
+                    ch = str(pid_value)[0].upper()
+                    if ch in ['A', 'B', 'C']:
+                        return 'children'
+                    if ch in ['P', 'S']:
+                        return 'adults'
+                    return 'other'
+
+                # Recompute counts from intersection
+                intersection_counts = {
+                    'total': 0,
+                    'children': 0,
+                    'adults': 0,
+                    'gender': {
+                        'children': {'M': 0, 'F': 0, 'O': 0},
+                        'adults': {'M': 0, 'F': 0, 'O': 0}
+                    }
+                }
+                for pid in inter:
+                    cohort = cohort_from_pid(pid)
+                    if cohort not in ['children', 'adults']:
+                        continue
+                    intersection_counts['total'] += 1
+                    intersection_counts[cohort] += 1
+                    g = (gender_map.get(pid) or 'Unknown')
+                    g_upper = str(g).upper() if isinstance(g, str) else 'UNKNOWN'
+                    if cohort == 'children':
+                        if g_upper in ['M', 'MALE']:
+                            intersection_counts['gender']['children']['M'] += 1
+                        elif g_upper in ['F', 'FEMALE']:
+                            intersection_counts['gender']['children']['F'] += 1
+                        else:
+                            intersection_counts['gender']['children']['O'] += 1
+                    else:
+                        if g_upper in ['M', 'MALE']:
+                            intersection_counts['gender']['adults']['M'] += 1
+                        elif g_upper in ['F', 'FEMALE']:
+                            intersection_counts['gender']['adults']['F'] += 1
+                        else:
+                            intersection_counts['gender']['adults']['O'] += 1
+        except Exception:
+            pass
+
+        # Attach Combined from true intersection (even if zero) for multi-filter searches
+        if isinstance(filters, list) and len(filters) >= 2:
+            results['Combined'] = { 'counts': intersection_counts }
+
         cursor.close()
         conn.close()
-
-        # Compute min-based combined across filters if 2+ filters
-        if len(filter_counts) >= 2:
-            def get_val(fc, cohort, key):
-                return int((((fc.get('gender') or {}).get(cohort) or {}).get(key, 0)) or 0)
-
-            adults_m = min(get_val(fc, 'adults', 'M') for fc in filter_counts)
-            adults_f = min(get_val(fc, 'adults', 'F') for fc in filter_counts)
-            adults_o = min(get_val(fc, 'adults', 'O') for fc in filter_counts)
-            children_m = min(get_val(fc, 'children', 'M') for fc in filter_counts)
-            children_f = min(get_val(fc, 'children', 'F') for fc in filter_counts)
-            children_o = min(get_val(fc, 'children', 'O') for fc in filter_counts)
-
-            adults_total = adults_m + adults_f + adults_o
-            children_total = children_m + children_f + children_o
-            combined_min_counts = {
-                'total': adults_total + children_total,
-                'children': children_total,
-                'adults': adults_total,
-                'gender': {
-                    'children': {'M': children_m, 'F': children_f, 'O': children_o},
-                    'adults': {'M': adults_m, 'F': adults_f, 'O': adults_o}
-                }
-            }
-            results['Combined'] = { 'counts': combined_min_counts }
-
-        # Ensure Combined only reflects the min-based combined when multiple filters are used
 
         return jsonify({
             'status': 'success',

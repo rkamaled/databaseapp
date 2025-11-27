@@ -4,6 +4,9 @@ import pyodbc
 from dotenv import load_dotenv
 import os
 
+#import genetic query module for functions (used in query_data at the end)
+import genetics_process as gPro
+
 # Load environment variables
 load_dotenv()
 
@@ -48,13 +51,15 @@ MODALITY_MAPPING = {
         'tables': [
             {'name': 'life_labs_2025', 'type': 'both', "gender_column": ""},
         ]
-    }
+    },
     
-    # 'Genotype Data': {
-    #     'tables': [
-    #         {'name': 'genotype_data_2025', 'type': '*', "gender_column": ""},
-    #     ]
-    # }
+
+    #assuming this will need this to say type is both here? Zach
+    'Genotype Data': {
+        'tables': [
+            {'name': 'genotype_2025', 'type': 'both', "gender_column": ""},
+        ]
+     }
 }
 
 def get_db_connection():
@@ -194,6 +199,15 @@ def get_variables(modality, cohort_type):
         cursor.close()
         conn.close()
 
+        #for genetic data, we don't want to return columns to front end - because this is participants and we are not filtering based on participants. Instead we want them to be able to search for text in the "manifest_name" column, but we can't return this for a drop down menu because there are 2 million of them. Instead we want to render an input text box for this and query from there. 
+
+        #So we can perhaps have this conditional logic for genotype modality and communicate this to the UI accordingly
+        if modality == "Genotype Data":
+            return jsonify({
+                'status': 'success',
+                'variables': []
+            })
+
         return jsonify({
             'status': 'success',
             'variables': sorted([v for v in variables.values()], key=lambda x: x['name'])
@@ -246,7 +260,8 @@ def _build_pid_filter_conditions(table_type, selected_cohorts):
 def build_filter_queries(modality, logic_parameters):
     """Build SQL queries for a specific modality and its logic parameters"""
     # Get the actual table mappings for this modality
-    modality_config = MODALITY_MAPPING.get(modality)
+    modality_lookup = 'Genotype Data' if modality == 'genetic' else modality
+    modality_config = MODALITY_MAPPING.get(modality_lookup)
     if not modality_config:
         raise ValueError(f"No table mapping found for modality: {modality}")
     
@@ -324,9 +339,49 @@ def build_filter_queries(modality, logic_parameters):
         timepoints = logic_param.get('timepoints') if logic_param and logic_param.get('timepoints') else []
         thresholds = logic_param.get('thresholds') if logic_param and logic_param.get('thresholds') else []
         cohorts = logic_param.get('cohorts') if logic_param and logic_param.get('cohorts') else []
+
+        #Zach: introducing genetic specific logic which doesn't follow the same as other modalities 
+
+        '''
+        Zach: Im not sure this will work right off the bat - but hopefully it does.
+        
+        '''
+
+        if modality == "genetic":
+            # Special-case: Build genotype row retrieval only and return immediately (do not append generic queries)
+            variables_for_table = ['manifest_name', "possible_rsids"] #we can hardcode these becauser they aren't selected by user - always the same for genetics
+
+            snp_list = logic_param.get('snp_input') if logic_param and logic_param.get('snp_input') else []
+            
+            if snp_list:
+                placeholders = ','.join(['?' for _ in snp_list])
+                # exact manifest_name match
+                exact_sql = f"SELECT * FROM {table_name} WHERE manifest_name IN ({placeholders})"
+                exact_params = snp_list.copy()
+                # possible_rsids match (exclude already exact-matched manifest_name)
+                possible_conditions = " OR ".join([
+                    f"EXISTS (SELECT 1 FROM STRING_SPLIT(possible_rsids, ';') AS s WHERE s.value = ?)"
+                    for _ in snp_list
+                ])
+                possible_sql = (
+                    f"SELECT * FROM {table_name} WHERE ({possible_conditions}) "
+                    f"AND manifest_name NOT IN ({placeholders})"
+                )
+                possible_params = snp_list.copy() + snp_list.copy()
+                combined_sql = f"{exact_sql} UNION ALL {possible_sql}"
+                combined_params = exact_params + possible_params
+                return combined_sql, combined_params
+            else:
+                # No SNPs provided; return an empty result set with correct schema
+                empty_sql = f"SELECT TOP 0 * FROM {table_name}"
+                return empty_sql, []
+
+
         # Variables scoped to the current table's cohort and membership
         # For 'both' type tables, include variables for both 'adults' and 'children' cohorts
+        
         if table_type == 'both':
+
             variables_for_table = []
             for var in (logic_param.get('variables') or []):
                 if not isinstance(var, dict):
@@ -718,7 +773,8 @@ def build_filter_queries(modality, logic_parameters):
 
 def build_filter_pid_query(modality, logic_parameters):
     """Build a SQL query that returns DISTINCT pid and gender eligible for this filter."""
-    modality_config = MODALITY_MAPPING.get(modality)
+    modality_lookup = 'Genotype Data' if modality == 'genetic' else modality
+    modality_config = MODALITY_MAPPING.get(modality_lookup)
     if not modality_config:
         raise ValueError(f"No table mapping found for modality: {modality}")
 
@@ -883,7 +939,8 @@ def build_filter_pid_query(modality, logic_parameters):
 
 def build_filter_pid_subselect(modality, logic_parameters):
     """Return a SQL subselect that yields DISTINCT pid for a single filter."""
-    modality_config = MODALITY_MAPPING.get(modality)
+    modality_lookup = 'Genotype Data' if modality == 'genetic' else modality
+    modality_config = MODALITY_MAPPING.get(modality_lookup)
     if not modality_config:
         raise ValueError(f"No table mapping found for modality: {modality}")
 
@@ -1059,6 +1116,7 @@ def query_data():
             has_thresholds = bool(lp0.get('thresholds'))
             has_cohorts = bool(lp0.get('cohorts'))
             has_variables = bool(lp0.get('variables'))
+
             if not (has_timepoints or has_thresholds or has_cohorts or has_variables):
                 return jsonify({'status': 'error', 'message': 'logicParameters must include timepoints, cohorts, thresholds, or variables'}), 400
         
@@ -1115,6 +1173,7 @@ def query_data():
                 try:
                     cursor.execute(query, params)
                     rows = cursor.fetchall()
+
                     counts = {
                         'total': 0,
                         'children': 0,
@@ -1125,27 +1184,112 @@ def query_data():
                         }
                     }
                     
-                    for row in rows:
-                        if row and len(row) >= 5:  # count, source, male_count, female_count, other_count
-                            count = row[0] or 0  # Use 0 if count is None
-                            source = row[1]
-                            male_count = row[2] or 0
-                            female_count = row[3] or 0
-                            other_count = row[4] or 0
+                    if modality == "genetic":
+
+                        import pandas as pd
+
+                        '''
+                        The object returned above will lack gender counts - we will need to map pids to sex and count for m/f before passing to front end. I'm not sure which table this should be mapped to from the db - but will need help with that part.
+
+                        '''
+
+                        #------------------------------------------------------------------------------------------------------------
+                        # ZACH: Hoping that the method for accessing the df from the query below will work, and same for the snp_list parameter passed in from the front end. Will need help to ensure this is coming in as an appropriate list object for the rest of the functions to work.
+                        #------------------------------------------------------------------------------------------------------------
+
+                        #Zach: run the genetic_query function from gen_query module.
+                        cols = [column[0] for column in cursor.description]
+                        df_genetic = pd.DataFrame.from_records(rows, columns=cols)
+
+                        #will need this to map possible_rsids to the desired ones for display in later applications (beyond basic counts) - when we make tables of rsids and genotype group counts.
+                        snp_list = logic_parameters[0].get('snp_list')
+
+                        #------------------------------------------------------------------------------------------------------------
+
+
+                        #run some functions to work with the queried genetic data. Note match types is just a dict that indicates if each SNP weas exact or from the possible_matches.
+                        sample_query_df, match_types = gPro.clean_genetic_query(df_genetic, snp_list)
+
+                        #Step 2. Split adults vs children based on pid string starts
+                        adult_df = sample_query_df[sample_query_df['pid'].str.startswith(('p', 's'))]
+                        child_df = sample_query_df[sample_query_df['pid'].str.startswith(('a', 'b', 'c'))]
+
+                        ### ****--------------------------------------------------------------------
+
+                        '''ZACH
+
+                        NOTE: The function calls below are to generate a table of STATS for each SNP in both children and adults - and would be separate from standard sample size counts as is happening for other modalities for the database web app. For now, these can be dis-regarded and even commented out - however, eventually this would be useful as an additional two tables to print beneath the main sample size table returned.
+
+                        '''
+
+                        #Step 3. Process each cohort into table of STATs with one row per SNP
+                        snp_stats_adult = gPro.cohort_snp_stats(adult_df, snp_list)  
+                        snp_stats_child = gPro.cohort_snp_stats(child_df, snp_list)
+
+                        #Step 4. Add warnings based on common genetic criteria
+                        snp_stats_adult = gPro.add_warnings(snp_stats_adult)
+                        snp_stats_child = gPro.add_warnings(snp_stats_child)
+      
+                        #--------------------------------------------------------------------
+                        #ZACH: THIS GIVES US THE MAIN SAMPLE SIZE COUNTS:
+                        #--------------------------------------------------------------------
+                        sample_size_counts = gPro.complete_record_count(adult_df, child_df, snp_list)
+
+                        '''
+                        The object returned above will lack gender counts - we will need to map pids to sex and count for m/f before passing to front end. I'm not sure which table this should be mapped to from the db - but will need help with that part.
+
+                        '''
+
+                        #--------------------------------------------------------------------
+                        # Map genders via participants table and compute cohort/gender counts
+                        warnings = []
+                        try:
+                            snps = snp_list or []
+                            valid_child_pids = []
+                            valid_adult_pids = []
+                            if snps:
+                                # helper to get pids with valid two-base genotypes across all SNPs
+                                def get_valid_pids(df_in, snps_in):
+                                    if df_in is None or df_in.empty:
+                                        return []
+                                    sub_df = df_in[snps_in]
+                                    sub_df = sub_df.dropna()
+                                    if sub_df.empty:
+                                        return []
+                                    valid_mask = sub_df.applymap(gPro.is_valid_genotype).all(axis=1)
+                                    if not valid_mask.any():
+                                        return []
+                                    return df_in.loc[sub_df.index[valid_mask], 'pid'].astype(str).tolist()
+                                
+                                valid_child_pids = get_valid_pids(child_df, snps)
+                                valid_adult_pids = get_valid_pids(adult_df, snps)
                             
-                            # Normalize source type to match our expected keys
-                            source_type = source.lower()  # Convert to lowercase to handle any case variations
-                            if source_type in ['children', 'adults']:  # Make sure it's a valid source type
-                                counts[source_type] = count
-                                counts['total'] += count
-                                counts['gender'][source_type]['M'] = male_count
-                                counts['gender'][source_type]['F'] = female_count
-                                counts['gender'][source_type]['O'] = other_count
-                    
-                    # Accumulate per-modality (avoid overwriting when same modality appears multiple times)
-                    if modality not in results:
-                        results[modality] = {
-                            'counts': {
+                            all_valid_pids = list({*valid_child_pids, *valid_adult_pids})
+                            pid_to_gender = {}
+                            if all_valid_pids:
+                                placeholders = ','.join(['?' for _ in all_valid_pids])
+                                cursor.execute(f"SELECT pid, gender FROM {PARTICIPANTS_TABLE} WHERE pid IN ({placeholders})", all_valid_pids)
+                                pg_rows = cursor.fetchall() or []
+                                for r in pg_rows:
+                                    pid_to_gender[str(r[0])] = r[1]
+                                missing = [pid for pid in all_valid_pids if pid not in pid_to_gender]
+                                if missing:
+                                    warnings.append(f"{len(missing)} PIDs missing in participants table; counted as 'Other'.")
+                                    for m in missing:
+                                        pid_to_gender[m] = None
+                            
+                            def normalize_gender(g):
+                                if g is None:
+                                    return 'O'
+                                s = str(g).strip()
+                                if s.upper() in ('M', 'MALE') or s.lower() == 'male':
+                                    return 'M'
+                                if s.upper() in ('F', 'FEMALE') or s.lower() == 'female':
+                                    return 'F'
+                                return 'O'
+                            
+                            # reset counts with genotype-specific totals
+                            counts = {
                                 'total': 0,
                                 'children': 0,
                                 'adults': 0,
@@ -1153,15 +1297,59 @@ def query_data():
                                     'children': {'M': 0, 'F': 0, 'O': 0},
                                     'adults': {'M': 0, 'F': 0, 'O': 0}
                                 }
-                            },
-                            'query': query
-                        }
-                    # Add to modality totals
-                    add_counts(results[modality]['counts'], counts)
-                    # Add to combined totals
-                    add_counts(combined_counts, counts)
-                    # Track per-filter counts for min-based combination
-                    filter_counts.append(counts)
+                            }
+                            
+                            for pid in valid_child_pids:
+                                gnorm = normalize_gender(pid_to_gender.get(pid))
+                                counts['children'] += 1
+                                counts['total'] += 1
+                                counts['gender']['children'][gnorm] += 1
+                            
+                            for pid in valid_adult_pids:
+                                gnorm = normalize_gender(pid_to_gender.get(pid))
+                                counts['adults'] += 1
+                                counts['total'] += 1
+                                counts['gender']['adults'][gnorm] += 1
+                            
+                            results[modality] = {
+                                'counts': counts,
+                                'query': query,
+                                'warnings': warnings
+                            }
+                            continue
+                        except Exception as _:
+                            results[modality] = {
+                                'counts': counts,
+                                'query': query,
+                                'warnings': ['Failed to map genders for genotype results.']
+                            }
+                            continue
+
+                    else:
+                        
+                        for row in rows:
+                            if row and len(row) >= 5:  # count, source, male_count, female_count, other_count
+                                count = row[0] or 0  # Use 0 if count is None
+                                source = row[1]
+                                male_count = row[2] or 0
+                                female_count = row[3] or 0
+                                other_count = row[4] or 0
+                                
+                                # Normalize source type to match our expected keys
+                                source_type = source.lower()  # Convert to lowercase to handle any case variations
+                                if source_type in ['children', 'adults']:  # Make sure it's a valid source type
+                                    counts[source_type] = count
+                                    counts['total'] += count
+                                    counts['gender'][source_type]['M'] = male_count
+                                    counts['gender'][source_type]['F'] = female_count
+                                    counts['gender'][source_type]['O'] = other_count
+                    
+
+                    results[modality] = {
+                        'counts': counts,
+                        'query': query
+                    }
+
                 except pyodbc.Error as e:
                     results[modality] = {
                         'error': str(e),

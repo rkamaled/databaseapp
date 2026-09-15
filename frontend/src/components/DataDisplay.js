@@ -1,6 +1,16 @@
 import React from 'react';
 import './DataDisplay.css';
 
+const SMALL_CELL_MAX = 5;
+
+const toDisplayCount = (value) => {
+  const n = Number(value || 0);
+  if (n > 0 && n <= SMALL_CELL_MAX) {
+    return 0;
+  }
+  return n;
+};
+
 const DataDisplay = ({ data, isLoading }) => {
   if (isLoading) {
     return (
@@ -60,6 +70,14 @@ const DataDisplay = ({ data, isLoading }) => {
     }
   );
 
+  const counts = combined || aggregated;
+  const maleAdults = toDisplayCount(counts.gender.adults.M);
+  const maleChildren = toDisplayCount(counts.gender.children.M);
+  const femaleAdults = toDisplayCount(counts.gender.adults.F);
+  const femaleChildren = toDisplayCount(counts.gender.children.F);
+  const otherAdults = toDisplayCount(counts.gender.adults.O);
+  const otherChildren = toDisplayCount(counts.gender.children.O);
+
   return (
     <div className="data-display">
       <div className="data-header">
@@ -81,27 +99,27 @@ const DataDisplay = ({ data, isLoading }) => {
               <tbody>
                 <tr>
                   <td><strong>N</strong></td>
-                  <td>{(combined ? combined.adults : aggregated.adults)}</td>
-                  <td>{(combined ? combined.children : aggregated.children)}</td>
-                  <td>{(combined ? combined.total : aggregated.total)}</td>
+                  <td>{toDisplayCount(counts.adults)}</td>
+                  <td>{toDisplayCount(counts.children)}</td>
+                  <td>{toDisplayCount(counts.total)}</td>
                 </tr>
                 <tr>
                   <td><strong>Male</strong></td>
-                  <td>{(combined ? combined.gender.adults.M : aggregated.gender.adults.M)}</td>
-                  <td>{(combined ? combined.gender.children.M : aggregated.gender.children.M)}</td>
-                  <td>{(combined ? (combined.gender.adults.M + combined.gender.children.M) : (aggregated.gender.adults.M + aggregated.gender.children.M))}</td>
+                  <td>{maleAdults}</td>
+                  <td>{maleChildren}</td>
+                  <td>{toDisplayCount(maleAdults + maleChildren)}</td>
                 </tr>
                 <tr>
                   <td><strong>Female</strong></td>
-                  <td>{(combined ? combined.gender.adults.F : aggregated.gender.adults.F)}</td>
-                  <td>{(combined ? combined.gender.children.F : aggregated.gender.children.F)}</td>
-                  <td>{(combined ? (combined.gender.adults.F + combined.gender.children.F) : (aggregated.gender.adults.F + aggregated.gender.children.F))}</td>
+                  <td>{femaleAdults}</td>
+                  <td>{femaleChildren}</td>
+                  <td>{toDisplayCount(femaleAdults + femaleChildren)}</td>
                 </tr>
                 <tr>
                   <td><strong>Other</strong></td>
-                  <td>{(combined ? combined.gender.adults.O : aggregated.gender.adults.O)}</td>
-                  <td>{(combined ? combined.gender.children.O : aggregated.gender.children.O)}</td>
-                  <td>{(combined ? (combined.gender.adults.O + combined.gender.children.O) : (aggregated.gender.adults.O + aggregated.gender.children.O))}</td>
+                  <td>{otherAdults}</td>
+                  <td>{otherChildren}</td>
+                  <td>{toDisplayCount(otherAdults + otherChildren)}</td>
                 </tr>
               </tbody>
             </table>

@@ -229,12 +229,97 @@ def test_connection():
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
-def _build_not_null_conditions(variables):
-    """Build SQL conditions to check for NOT NULL values in selected variables"""
+def _sql_value_is_present(column_sql):
+    """SQL predicate: column has a real value, not NULL or a missing-data token."""
+    return (
+        f"({column_sql} IS NOT NULL AND "
+        f"UPPER(LTRIM(RTRIM(CAST({column_sql} AS NVARCHAR(MAX))))) "
+        f"NOT IN ('', 'NA', 'N/A', 'NAN', '.'))"
+    )
+
+
+def _build_present_conditions(variables, alias='t'):
+    """AND together present-value checks for selected variables. None if none apply."""
     if not variables:
-        return "1=1"  # No variables selected, always true
-    conditions = [f"t.{var['name']} IS NOT NULL" for var in variables]  # Use table alias 't' for variables
+        return None
+    conditions = []
+    for var in variables:
+        name = var.get('name') if isinstance(var, dict) else None
+        if not name:
+            continue
+        conditions.append(_sql_value_is_present(f"{alias}.{name}"))
+    if not conditions:
+        return None
     return " AND ".join(conditions)
+
+
+def _complete_case_having_sql(variables, timepoint_count, alias='t'):
+    """Require a real (non-NA) value for every selected variable at each selected timepoint."""
+    present = _build_present_conditions(variables, alias)
+    if not present:
+        return ""
+    return (
+        f" AND COUNT(DISTINCT CASE WHEN {present} THEN {alias}.time_point END) = {int(timepoint_count)}"
+    )
+
+
+# Map counts of 1–5 to 0 so small cells are not shown as real sample sizes.
+SMALL_CELL_MAX = 5
+
+
+def _safe_int(value):
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _zero_small_count(value):
+    """Return 0 when the count is between 1 and SMALL_CELL_MAX inclusive."""
+    n = _safe_int(value)
+    if 1 <= n <= SMALL_CELL_MAX:
+        return 0
+    return n
+
+
+def _redact_small_counts(counts):
+    """Copy a counts object with any 1–5 values mapped to 0."""
+    if not isinstance(counts, dict):
+        return counts
+    gender = counts.get('gender') or {}
+    adults_g = gender.get('adults') or {}
+    children_g = gender.get('children') or {}
+    return {
+        'total': _zero_small_count(counts.get('total')),
+        'adults': _zero_small_count(counts.get('adults')),
+        'children': _zero_small_count(counts.get('children')),
+        'gender': {
+            'adults': {
+                'M': _zero_small_count(adults_g.get('M')),
+                'F': _zero_small_count(adults_g.get('F')),
+                'O': _zero_small_count(adults_g.get('O')),
+            },
+            'children': {
+                'M': _zero_small_count(children_g.get('M')),
+                'F': _zero_small_count(children_g.get('F')),
+                'O': _zero_small_count(children_g.get('O')),
+            },
+        },
+    }
+
+
+def _redact_results_small_cells(results):
+    """Apply small-cell zeroing to every counts payload in a results dict."""
+    if not isinstance(results, dict):
+        return results
+    redacted = {}
+    for key, entry in results.items():
+        if isinstance(entry, dict) and isinstance(entry.get('counts'), dict):
+            redacted[key] = {**entry, 'counts': _redact_small_counts(entry['counts'])}
+        else:
+            redacted[key] = entry
+    return redacted
+
 
 def _build_pid_filter_conditions(table_type, selected_cohorts):
     """Build SQL conditions to filter PIDs based on table type and selected cohorts"""
@@ -453,10 +538,9 @@ def build_filter_queries(modality, logic_parameters):
         timepoint_params = [int(tp) for tp in timepoints]
         
 
-        # Build conditional HAVING clause for NOT NULL checks only if variables are provided for this table
-        having_not_null_clause_single = (
-            f" AND COUNT(CASE WHEN {_build_not_null_conditions(variables_for_table)} THEN 1 END) = {len(timepoints)}"
-            if variables_for_table else ""
+        # Require non-NA values for selected variables at every selected timepoint
+        having_not_null_clause_single = _complete_case_having_sql(
+            variables_for_table, len(timepoints), alias='t'
         )
 
         # Build PID filtering conditions for 'both' type tables
@@ -663,6 +747,48 @@ def build_filter_queries(modality, logic_parameters):
                 else:
                     agg_cols_list.append(f"MAX(u.{col}) AS {col}")
             agg_cols = ",\n                        ".join(agg_cols_list)
+
+            # Build threshold conditions against CombinedData alias before formatting SQL
+            threshold_conditions = []
+            params_merged = timepoint_params.copy()
+            for threshold in all_thresholds:
+                variable_obj = threshold.get('variable')
+                operator = threshold.get('operator')
+                value = threshold.get('value')
+                value2 = threshold.get('value2')
+                if not variable_obj or not operator:
+                    continue
+                if operator not in ['IS NULL','IS NOT NULL'] and value is None:
+                    continue
+                var_name = variable_obj.get('name')
+                if var_name not in union_columns:
+                    continue
+                vtype = variable_obj.get('type')
+                if operator == 'between' and value2 is not None:
+                    threshold_conditions.append(f"cd.{var_name} BETWEEN ? AND ?")
+                    if vtype == 'number':
+                        params_merged.extend([float(value), float(value2)])
+                    else:
+                        params_merged.extend([value, value2])
+                elif operator in ['LIKE', 'NOT LIKE']:
+                    threshold_conditions.append(f"cd.{var_name} {operator} ?")
+                    params_merged.append(f"%{value}%")
+                elif operator in ['IS NULL', 'IS NOT NULL']:
+                    threshold_conditions.append(f"cd.{var_name} {operator}")
+                else:
+                    threshold_conditions.append(f"cd.{var_name} {operator} ?")
+                    if vtype == 'number':
+                        params_merged.append(float(value))
+                    else:
+                        params_merged.append(value)
+
+            where_th = (" AND " + " AND ".join(threshold_conditions)) if threshold_conditions else ""
+            selected_vars = [
+                v for v in all_variables
+                if isinstance(v, dict) and v.get('cohort') == cohort_type and v.get('name') in union_columns
+            ]
+            having_not_null = _complete_case_having_sql(selected_vars, len(timepoints), alias='cd')
+
             combined_query = """
                 WITH Unioned AS (
                     {union_all}
@@ -706,60 +832,9 @@ def build_filter_queries(modality, logic_parameters):
                 cohort=cohort_type,
                 timepoints=','.join(['?' for _ in timepoints]),
                 len_timepoints=len(timepoints),
-                where_th='',  # thresholds below
-                having_not_null=''  # will fill below
+                where_th=where_th,
+                having_not_null=having_not_null
             )
-
-            # Build threshold conditions against CombinedData alias
-            threshold_conditions = []
-            params_merged = timepoint_params.copy()
-            for threshold in all_thresholds:
-                variable_obj = threshold.get('variable')
-                operator = threshold.get('operator')
-                value = threshold.get('value')
-                value2 = threshold.get('value2')
-                if not variable_obj or not operator:
-                    continue
-                if operator not in ['IS NULL','IS NOT NULL'] and value is None:
-                    continue
-                var_name = variable_obj.get('name')
-                if var_name not in union_columns:
-                    continue
-                vtype = variable_obj.get('type')
-                if operator == 'between' and value2 is not None:
-                    threshold_conditions.append(f"cd.{var_name} BETWEEN ? AND ?")
-                    if vtype == 'number':
-                        params_merged.extend([float(value), float(value2)])
-                    else:
-                        params_merged.extend([value, value2])
-                elif operator in ['LIKE', 'NOT LIKE']:
-                    threshold_conditions.append(f"cd.{var_name} {operator} ?")
-                    params_merged.append(f"%{value}%")
-                elif operator in ['IS NULL', 'IS NOT NULL']:
-                    threshold_conditions.append(f"cd.{var_name} {operator}")
-                else:
-                    threshold_conditions.append(f"cd.{var_name} {operator} ?")
-                    if vtype == 'number':
-                        params_merged.append(float(value))
-                    else:
-                        params_merged.append(value)
-
-            # Inject thresholds into WHERE
-            if threshold_conditions:
-                combined_query = combined_query.replace("{where_th}", " AND " + " AND ".join(threshold_conditions))
-            else:
-                combined_query = combined_query.replace("{where_th}", "")
-
-            # Build NOT NULL having clause for selected variables present in union
-            selected_vars = [v for v in all_variables if isinstance(v, dict) and v.get('cohort') == cohort_type and v.get('name') in union_columns]
-            if selected_vars:
-                not_null_conditions = " AND ".join([f"cd.{v['name']} IS NOT NULL" for v in selected_vars])
-                having_clause = f" AND COUNT(CASE WHEN {not_null_conditions} THEN 1 END) = {len(timepoints)}"
-                combined_query = combined_query.replace("{having_not_null}", having_clause)
-            else:
-                combined_query = combined_query.replace("{having_not_null}", "")
-
-            combined_query = combined_query.replace("{where_th}", "")
             queries = [combined_query]
             all_params = params_merged
         else:
@@ -866,9 +941,8 @@ def build_filter_pid_query(modality, logic_parameters):
             timepoints = [1, 2, 3, 4, 5, 6, 7, 8, 9]
         timepoint_params = [int(tp) for tp in timepoints]
 
-        having_not_null_clause_single = (
-            f" AND COUNT(CASE WHEN {_build_not_null_conditions(variables_for_table)} THEN 1 END) = {len(timepoints)}"
-            if variables_for_table else ""
+        having_not_null_clause_single = _complete_case_having_sql(
+            variables_for_table, len(timepoints), alias='t'
         )
 
         pid_filter_condition = _build_pid_filter_conditions(table_type, selected_cohorts)
@@ -1033,9 +1107,8 @@ def build_filter_pid_subselect(modality, logic_parameters):
             tps = [1, 2, 3, 4, 5, 6, 7, 8, 9]
         tp_params = [int(tp) for tp in tps]
 
-        having_not_null_clause_single = (
-            f" AND COUNT(CASE WHEN {_build_not_null_conditions(variables_for_table)} THEN 1 END) = {len(tps)}"
-            if variables_for_table else ""
+        having_not_null_clause_single = _complete_case_having_sql(
+            variables_for_table, len(tps), alias='t'
         )
 
         pid_filter_condition = _build_pid_filter_conditions(table_type, selected_cohorts)
@@ -1490,7 +1563,7 @@ def query_data():
 
         return jsonify({
             'status': 'success',
-            'results': results
+            'results': _redact_results_small_cells(results)
         })
 
     except Exception as e:

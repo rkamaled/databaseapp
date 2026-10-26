@@ -4,6 +4,9 @@ import pyodbc
 from dotenv import load_dotenv
 import os
 
+#import genetic query module for functions (used in query_data at the end)
+import genetics_process as gPro
+
 # Load environment variables
 load_dotenv()
 
@@ -48,13 +51,15 @@ MODALITY_MAPPING = {
         'tables': [
             {'name': 'life_labs_2025', 'type': 'both', "gender_column": ""},
         ]
-    }
+    },
     
-    # 'Genotype Data': {
-    #     'tables': [
-    #         {'name': 'genotype_data_2025', 'type': '*', "gender_column": ""},
-    #     ]
-    # }
+
+    #assuming this will need this to say type is both here? Zach
+    'Genotype Data': {
+        'tables': [
+            {'name': 'genotype_2025', 'type': 'both', "gender_column": ""},
+        ]
+     }
 }
 
 def get_db_connection():
@@ -194,6 +199,15 @@ def get_variables(modality, cohort_type):
         cursor.close()
         conn.close()
 
+        #for genetic data, we don't want to return columns to front end - because this is participants and we are not filtering based on participants. Instead we want them to be able to search for text in the "manifest_name" column, but we can't return this for a drop down menu because there are 2 million of them. Instead we want to render an input text box for this and query from there. 
+
+        #So we can perhaps have this conditional logic for genotype modality and communicate this to the UI accordingly
+        if modality == "Genotype Data":
+            return jsonify({
+                'status': 'success',
+                'variables': []
+            })
+
         return jsonify({
             'status': 'success',
             'variables': sorted([v for v in variables.values()], key=lambda x: x['name'])
@@ -215,12 +229,97 @@ def test_connection():
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
-def _build_not_null_conditions(variables):
-    """Build SQL conditions to check for NOT NULL values in selected variables"""
+def _sql_value_is_present(column_sql):
+    """SQL predicate: column has a real value, not NULL or a missing-data token."""
+    return (
+        f"({column_sql} IS NOT NULL AND "
+        f"UPPER(LTRIM(RTRIM(CAST({column_sql} AS NVARCHAR(MAX))))) "
+        f"NOT IN ('', 'NA', 'N/A', 'NAN', '.'))"
+    )
+
+
+def _build_present_conditions(variables, alias='t'):
+    """AND together present-value checks for selected variables. None if none apply."""
     if not variables:
-        return "1=1"  # No variables selected, always true
-    conditions = [f"t.{var['name']} IS NOT NULL" for var in variables]  # Use table alias 't' for variables
+        return None
+    conditions = []
+    for var in variables:
+        name = var.get('name') if isinstance(var, dict) else None
+        if not name:
+            continue
+        conditions.append(_sql_value_is_present(f"{alias}.{name}"))
+    if not conditions:
+        return None
     return " AND ".join(conditions)
+
+
+def _complete_case_having_sql(variables, timepoint_count, alias='t'):
+    """Require a real (non-NA) value for every selected variable at each selected timepoint."""
+    present = _build_present_conditions(variables, alias)
+    if not present:
+        return ""
+    return (
+        f" AND COUNT(DISTINCT CASE WHEN {present} THEN {alias}.time_point END) = {int(timepoint_count)}"
+    )
+
+
+# Map counts of 1–5 to 0 so small cells are not shown as real sample sizes.
+SMALL_CELL_MAX = 5
+
+
+def _safe_int(value):
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _zero_small_count(value):
+    """Return 0 when the count is between 1 and SMALL_CELL_MAX inclusive."""
+    n = _safe_int(value)
+    if 1 <= n <= SMALL_CELL_MAX:
+        return 0
+    return n
+
+
+def _redact_small_counts(counts):
+    """Copy a counts object with any 1–5 values mapped to 0."""
+    if not isinstance(counts, dict):
+        return counts
+    gender = counts.get('gender') or {}
+    adults_g = gender.get('adults') or {}
+    children_g = gender.get('children') or {}
+    return {
+        'total': _zero_small_count(counts.get('total')),
+        'adults': _zero_small_count(counts.get('adults')),
+        'children': _zero_small_count(counts.get('children')),
+        'gender': {
+            'adults': {
+                'M': _zero_small_count(adults_g.get('M')),
+                'F': _zero_small_count(adults_g.get('F')),
+                'O': _zero_small_count(adults_g.get('O')),
+            },
+            'children': {
+                'M': _zero_small_count(children_g.get('M')),
+                'F': _zero_small_count(children_g.get('F')),
+                'O': _zero_small_count(children_g.get('O')),
+            },
+        },
+    }
+
+
+def _redact_results_small_cells(results):
+    """Apply small-cell zeroing to every counts payload in a results dict."""
+    if not isinstance(results, dict):
+        return results
+    redacted = {}
+    for key, entry in results.items():
+        if isinstance(entry, dict) and isinstance(entry.get('counts'), dict):
+            redacted[key] = {**entry, 'counts': _redact_small_counts(entry['counts'])}
+        else:
+            redacted[key] = entry
+    return redacted
+
 
 def _build_pid_filter_conditions(table_type, selected_cohorts):
     """Build SQL conditions to filter PIDs based on table type and selected cohorts"""
@@ -246,7 +345,8 @@ def _build_pid_filter_conditions(table_type, selected_cohorts):
 def build_filter_queries(modality, logic_parameters):
     """Build SQL queries for a specific modality and its logic parameters"""
     # Get the actual table mappings for this modality
-    modality_config = MODALITY_MAPPING.get(modality)
+    modality_lookup = 'Genotype Data' if modality == 'genetic' else modality
+    modality_config = MODALITY_MAPPING.get(modality_lookup)
     if not modality_config:
         raise ValueError(f"No table mapping found for modality: {modality}")
     
@@ -324,9 +424,49 @@ def build_filter_queries(modality, logic_parameters):
         timepoints = logic_param.get('timepoints') if logic_param and logic_param.get('timepoints') else []
         thresholds = logic_param.get('thresholds') if logic_param and logic_param.get('thresholds') else []
         cohorts = logic_param.get('cohorts') if logic_param and logic_param.get('cohorts') else []
+
+        #Zach: introducing genetic specific logic which doesn't follow the same as other modalities 
+
+        '''
+        Zach: Im not sure this will work right off the bat - but hopefully it does.
+        
+        '''
+
+        if modality == "genetic":
+            # Special-case: Build genotype row retrieval only and return immediately (do not append generic queries)
+            variables_for_table = ['manifest_name', "possible_rsids"] #we can hardcode these becauser they aren't selected by user - always the same for genetics
+
+            snp_list = logic_param.get('snp_input') if logic_param and logic_param.get('snp_input') else []
+            
+            if snp_list:
+                placeholders = ','.join(['?' for _ in snp_list])
+                # exact manifest_name match
+                exact_sql = f"SELECT * FROM {table_name} WHERE manifest_name IN ({placeholders})"
+                exact_params = snp_list.copy()
+                # possible_rsids match (exclude already exact-matched manifest_name)
+                possible_conditions = " OR ".join([
+                    f"EXISTS (SELECT 1 FROM STRING_SPLIT(possible_rsids, ';') AS s WHERE s.value = ?)"
+                    for _ in snp_list
+                ])
+                possible_sql = (
+                    f"SELECT * FROM {table_name} WHERE ({possible_conditions}) "
+                    f"AND manifest_name NOT IN ({placeholders})"
+                )
+                possible_params = snp_list.copy() + snp_list.copy()
+                combined_sql = f"{exact_sql} UNION ALL {possible_sql}"
+                combined_params = exact_params + possible_params
+                return combined_sql, combined_params
+            else:
+                # No SNPs provided; return an empty result set with correct schema
+                empty_sql = f"SELECT TOP 0 * FROM {table_name}"
+                return empty_sql, []
+
+
         # Variables scoped to the current table's cohort and membership
         # For 'both' type tables, include variables for both 'adults' and 'children' cohorts
+        
         if table_type == 'both':
+
             variables_for_table = []
             for var in (logic_param.get('variables') or []):
                 if not isinstance(var, dict):
@@ -398,10 +538,9 @@ def build_filter_queries(modality, logic_parameters):
         timepoint_params = [int(tp) for tp in timepoints]
         
 
-        # Build conditional HAVING clause for NOT NULL checks only if variables are provided for this table
-        having_not_null_clause_single = (
-            f" AND COUNT(CASE WHEN {_build_not_null_conditions(variables_for_table)} THEN 1 END) = {len(timepoints)}"
-            if variables_for_table else ""
+        # Require non-NA values for selected variables at every selected timepoint
+        having_not_null_clause_single = _complete_case_having_sql(
+            variables_for_table, len(timepoints), alias='t'
         )
 
         # Build PID filtering conditions for 'both' type tables
@@ -608,6 +747,48 @@ def build_filter_queries(modality, logic_parameters):
                 else:
                     agg_cols_list.append(f"MAX(u.{col}) AS {col}")
             agg_cols = ",\n                        ".join(agg_cols_list)
+
+            # Build threshold conditions against CombinedData alias before formatting SQL
+            threshold_conditions = []
+            params_merged = timepoint_params.copy()
+            for threshold in all_thresholds:
+                variable_obj = threshold.get('variable')
+                operator = threshold.get('operator')
+                value = threshold.get('value')
+                value2 = threshold.get('value2')
+                if not variable_obj or not operator:
+                    continue
+                if operator not in ['IS NULL','IS NOT NULL'] and value is None:
+                    continue
+                var_name = variable_obj.get('name')
+                if var_name not in union_columns:
+                    continue
+                vtype = variable_obj.get('type')
+                if operator == 'between' and value2 is not None:
+                    threshold_conditions.append(f"cd.{var_name} BETWEEN ? AND ?")
+                    if vtype == 'number':
+                        params_merged.extend([float(value), float(value2)])
+                    else:
+                        params_merged.extend([value, value2])
+                elif operator in ['LIKE', 'NOT LIKE']:
+                    threshold_conditions.append(f"cd.{var_name} {operator} ?")
+                    params_merged.append(f"%{value}%")
+                elif operator in ['IS NULL', 'IS NOT NULL']:
+                    threshold_conditions.append(f"cd.{var_name} {operator}")
+                else:
+                    threshold_conditions.append(f"cd.{var_name} {operator} ?")
+                    if vtype == 'number':
+                        params_merged.append(float(value))
+                    else:
+                        params_merged.append(value)
+
+            where_th = (" AND " + " AND ".join(threshold_conditions)) if threshold_conditions else ""
+            selected_vars = [
+                v for v in all_variables
+                if isinstance(v, dict) and v.get('cohort') == cohort_type and v.get('name') in union_columns
+            ]
+            having_not_null = _complete_case_having_sql(selected_vars, len(timepoints), alias='cd')
+
             combined_query = """
                 WITH Unioned AS (
                     {union_all}
@@ -651,60 +832,9 @@ def build_filter_queries(modality, logic_parameters):
                 cohort=cohort_type,
                 timepoints=','.join(['?' for _ in timepoints]),
                 len_timepoints=len(timepoints),
-                where_th='',  # thresholds below
-                having_not_null=''  # will fill below
+                where_th=where_th,
+                having_not_null=having_not_null
             )
-
-            # Build threshold conditions against CombinedData alias
-            threshold_conditions = []
-            params_merged = timepoint_params.copy()
-            for threshold in all_thresholds:
-                variable_obj = threshold.get('variable')
-                operator = threshold.get('operator')
-                value = threshold.get('value')
-                value2 = threshold.get('value2')
-                if not variable_obj or not operator:
-                    continue
-                if operator not in ['IS NULL','IS NOT NULL'] and value is None:
-                    continue
-                var_name = variable_obj.get('name')
-                if var_name not in union_columns:
-                    continue
-                vtype = variable_obj.get('type')
-                if operator == 'between' and value2 is not None:
-                    threshold_conditions.append(f"cd.{var_name} BETWEEN ? AND ?")
-                    if vtype == 'number':
-                        params_merged.extend([float(value), float(value2)])
-                    else:
-                        params_merged.extend([value, value2])
-                elif operator in ['LIKE', 'NOT LIKE']:
-                    threshold_conditions.append(f"cd.{var_name} {operator} ?")
-                    params_merged.append(f"%{value}%")
-                elif operator in ['IS NULL', 'IS NOT NULL']:
-                    threshold_conditions.append(f"cd.{var_name} {operator}")
-                else:
-                    threshold_conditions.append(f"cd.{var_name} {operator} ?")
-                    if vtype == 'number':
-                        params_merged.append(float(value))
-                    else:
-                        params_merged.append(value)
-
-            # Inject thresholds into WHERE
-            if threshold_conditions:
-                combined_query = combined_query.replace("{where_th}", " AND " + " AND ".join(threshold_conditions))
-            else:
-                combined_query = combined_query.replace("{where_th}", "")
-
-            # Build NOT NULL having clause for selected variables present in union
-            selected_vars = [v for v in all_variables if isinstance(v, dict) and v.get('cohort') == cohort_type and v.get('name') in union_columns]
-            if selected_vars:
-                not_null_conditions = " AND ".join([f"cd.{v['name']} IS NOT NULL" for v in selected_vars])
-                having_clause = f" AND COUNT(CASE WHEN {not_null_conditions} THEN 1 END) = {len(timepoints)}"
-                combined_query = combined_query.replace("{having_not_null}", having_clause)
-            else:
-                combined_query = combined_query.replace("{having_not_null}", "")
-
-            combined_query = combined_query.replace("{where_th}", "")
             queries = [combined_query]
             all_params = params_merged
         else:
@@ -715,6 +845,331 @@ def build_filter_queries(modality, logic_parameters):
         combined_query = queries[0]
 
     return combined_query, all_params
+
+def build_filter_pid_query(modality, logic_parameters):
+    """Build a SQL query that returns DISTINCT pid and gender eligible for this filter."""
+    modality_lookup = 'Genotype Data' if modality == 'genetic' else modality
+    modality_config = MODALITY_MAPPING.get(modality_lookup)
+    if not modality_config:
+        raise ValueError(f"No table mapping found for modality: {modality}")
+
+    # Determine selected tables based on cohorts
+    selected_tables = []
+    selected_cohorts = []
+    if logic_parameters and len(logic_parameters) > 0:
+        selected_cohorts = logic_parameters[0].get('cohorts', [])
+    has_children = 'children' in selected_cohorts
+    has_adults = 'adults' in selected_cohorts or 'adult' in selected_cohorts
+    if not selected_cohorts or (has_children and has_adults):
+        selected_tables = modality_config['tables'].copy()
+    else:
+        for table_config in modality_config['tables']:
+            table_type = table_config['type']
+            if (table_type == 'children' and has_children) or \
+               (table_type == 'adults' and has_adults) or \
+               (table_type == 'both' and (has_children or has_adults)):
+                selected_tables.append(table_config)
+
+    # Discover columns for variable/threshold scoping
+    columns_per_table = {}
+    try:
+        conn_cols = get_db_connection()
+        if conn_cols:
+            cur_cols = conn_cols.cursor()
+            for table_cfg in selected_tables:
+                tname = table_cfg['name']
+                try:
+                    cur_cols.execute(f"SELECT TOP 0 * FROM {tname}")
+                    col_names = set()
+                    for col in cur_cols.description:
+                        col_names.add(col[0])
+                    columns_per_table[tname] = col_names
+                except Exception:
+                    columns_per_table[tname] = set()
+            cur_cols.close()
+            conn_cols.close()
+    except Exception:
+        pass
+
+    subselects = []
+    all_params = []
+
+    for table_config in selected_tables:
+        table_name = table_config['name']
+        table_type = table_config['type']
+
+        logic_param = logic_parameters[0] if logic_parameters and len(logic_parameters) > 0 else {}
+        timepoints = logic_param.get('timepoints') if logic_param and logic_param.get('timepoints') else []
+        thresholds = logic_param.get('thresholds') if logic_param and logic_param.get('thresholds') else []
+
+        # Variables present on this table for NOT NULL checks
+        if table_type == 'both':
+            variables_for_table = []
+            for var in (logic_param.get('variables') or []):
+                if not isinstance(var, dict):
+                    continue
+                if var.get('cohort') not in ['adults', 'children', 'both']:
+                    continue
+                var_name = var.get('name')
+                var_tables = var.get('tables') if isinstance(var.get('tables'), list) else None
+                if var_tables:
+                    has_column = table_name in var_tables
+                else:
+                    table_cols = columns_per_table.get(table_name)
+                    has_column = (var_name in table_cols) if isinstance(table_cols, set) else True
+                if has_column:
+                    variables_for_table.append(var)
+        else:
+            variables_for_table = []
+            for var in (logic_param.get('variables') or []):
+                if not isinstance(var, dict):
+                    continue
+                if var.get('cohort') != table_type:
+                    continue
+                var_name = var.get('name')
+                var_tables = var.get('tables') if isinstance(var.get('tables'), list) else None
+                if var_tables:
+                    has_column = table_name in var_tables
+                else:
+                    table_cols = columns_per_table.get(table_name)
+                    has_column = (var_name in table_cols) if isinstance(table_cols, set) else True
+                if has_column:
+                    variables_for_table.append(var)
+
+        # Timepoints
+        if not timepoints or timepoints == [] or 'all' in timepoints:
+            timepoints = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+        timepoint_params = [int(tp) for tp in timepoints]
+
+        having_not_null_clause_single = _complete_case_having_sql(
+            variables_for_table, len(timepoints), alias='t'
+        )
+
+        pid_filter_condition = _build_pid_filter_conditions(table_type, selected_cohorts)
+
+        # Threshold conditions
+        threshold_conditions = []
+        params = timepoint_params.copy()
+        for threshold in thresholds:
+            variable_obj = threshold.get('variable')
+            operator = threshold.get('operator')
+            value = threshold.get('value')
+            value2 = threshold.get('value2')
+            if not variable_obj or not operator:
+                continue
+            if operator not in ['IS NULL','IS NOT NULL'] and value is None:
+                continue
+            variable = variable_obj['name']
+            data_type = variable_obj['type']
+            if operator == 'between' and value2 is not None:
+                threshold_conditions.append(f"t.{variable} BETWEEN ? AND ?")
+                if data_type == 'number':
+                    params.extend([float(value), float(value2)])
+                else:
+                    params.extend([value, value2])
+            elif operator in ['LIKE', 'NOT LIKE']:
+                threshold_conditions.append(f"t.{variable} {operator} ?")
+                params.append(f"%{value}%")
+            elif operator in ['IS NULL', 'IS NOT NULL']:
+                threshold_conditions.append(f"t.{variable} {operator}")
+            else:
+                threshold_conditions.append(f"t.{variable} {operator} ?")
+                if data_type == 'number':
+                    params.append(float(value))
+                else:
+                    params.append(value)
+
+        thresholds_sql = (" AND " + " AND ".join(threshold_conditions)) if threshold_conditions else ""
+
+        # Build per-table subselect of eligible PIDs
+        subselect = f"""
+            SELECT t.pid
+            FROM {table_name} t
+            WHERE t.time_point IN ({','.join(['?' for _ in timepoints])})
+              AND {pid_filter_condition}
+              {thresholds_sql}
+            GROUP BY t.pid
+            HAVING COUNT(DISTINCT t.time_point) = {len(timepoints)}{having_not_null_clause_single}
+        """
+        subselects.append(subselect)
+        all_params.extend(params)
+
+    if not subselects:
+        return "SELECT pid, gender FROM (SELECT NULL as pid, NULL as gender) x WHERE 1=0", []
+
+    unioned = "\n            UNION ALL\n            ".join(subselects)
+    full_query = f"""
+        WITH UnionPids AS (
+            {unioned}
+        ),
+        DistinctPids AS (
+            SELECT DISTINCT pid FROM UnionPids
+        )
+        SELECT dp.pid, COALESCE(p.gender, 'Unknown') as gender
+        FROM DistinctPids dp
+        LEFT JOIN {PARTICIPANTS_TABLE} p ON dp.pid = p.pid
+    """
+    return full_query, all_params
+
+def build_filter_pid_subselect(modality, logic_parameters):
+    """Return a SQL subselect that yields DISTINCT pid for a single filter."""
+    modality_lookup = 'Genotype Data' if modality == 'genetic' else modality
+    modality_config = MODALITY_MAPPING.get(modality_lookup)
+    if not modality_config:
+        raise ValueError(f"No table mapping found for modality: {modality}")
+
+    # Determine tables for cohorts
+    selected_tables = []
+    selected_cohorts = []
+    if logic_parameters and len(logic_parameters) > 0:
+        selected_cohorts = logic_parameters[0].get('cohorts', [])
+    has_children = 'children' in selected_cohorts
+    has_adults = 'adults' in selected_cohorts or 'adult' in selected_cohorts
+    if not selected_cohorts or (has_children and has_adults):
+        selected_tables = modality_config['tables'].copy()
+    else:
+        for table_config in modality_config['tables']:
+            table_type = table_config['type']
+            if (table_type == 'children' and has_children) or \
+               (table_type == 'adults' and has_adults) or \
+               (table_type == 'both' and (has_children or has_adults)):
+                selected_tables.append(table_config)
+
+    # Discover columns for variable/threshold scoping
+    columns_per_table = {}
+    try:
+        conn_cols = get_db_connection()
+        if conn_cols:
+            cur_cols = conn_cols.cursor()
+            for table_cfg in selected_tables:
+                tname = table_cfg['name']
+                try:
+                    cur_cols.execute(f"SELECT TOP 0 * FROM {tname}")
+                    col_names = set(col[0] for col in cur_cols.description)
+                    columns_per_table[tname] = col_names
+                except Exception:
+                    columns_per_table[tname] = set()
+            cur_cols.close()
+            conn_cols.close()
+    except Exception:
+        pass
+
+    # Build union-of-tables subselects honoring thresholds and not-null variable checks
+    subselects = []
+    params_all = []
+
+    logic_param = logic_parameters[0] if logic_parameters and len(logic_parameters) > 0 else {}
+    timepoints = logic_param.get('timepoints') if logic_param and logic_param.get('timepoints') else []
+    thresholds = logic_param.get('thresholds') if logic_param and logic_param.get('thresholds') else []
+
+    # variables check per-table
+    for table_config in selected_tables:
+        table_name = table_config['name']
+        table_type = table_config['type']
+
+        # Variables present on this table for NOT NULL checks
+        if table_type == 'both':
+            variables_for_table = []
+            for var in (logic_param.get('variables') or []):
+                if not isinstance(var, dict):
+                    continue
+                if var.get('cohort') not in ['adults', 'children', 'both']:
+                    continue
+                var_name = var.get('name')
+                var_tables = var.get('tables') if isinstance(var.get('tables'), list) else None
+                if var_tables:
+                    has_column = table_name in var_tables
+                else:
+                    table_cols = columns_per_table.get(table_name)
+                    has_column = (var_name in table_cols) if isinstance(table_cols, set) else True
+                if has_column:
+                    variables_for_table.append(var)
+        else:
+            variables_for_table = []
+            for var in (logic_param.get('variables') or []):
+                if not isinstance(var, dict):
+                    continue
+                if var.get('cohort') != table_type:
+                    continue
+                var_name = var.get('name')
+                var_tables = var.get('tables') if isinstance(var.get('tables'), list) else None
+                if var_tables:
+                    has_column = table_name in var_tables
+                else:
+                    table_cols = columns_per_table.get(table_name)
+                    has_column = (var_name in table_cols) if isinstance(table_cols, set) else True
+                if has_column:
+                    variables_for_table.append(var)
+
+        # Timepoints
+        tps = timepoints
+        if not tps or tps == [] or 'all' in tps:
+            tps = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+        tp_params = [int(tp) for tp in tps]
+
+        having_not_null_clause_single = _complete_case_having_sql(
+            variables_for_table, len(tps), alias='t'
+        )
+
+        pid_filter_condition = _build_pid_filter_conditions(table_type, selected_cohorts)
+
+        # Threshold conditions and params
+        th_conditions = []
+        params = tp_params.copy()
+        for threshold in thresholds or []:
+            variable_obj = threshold.get('variable')
+            operator = threshold.get('operator')
+            value = threshold.get('value')
+            value2 = threshold.get('value2')
+            if not variable_obj or not operator:
+                continue
+            if operator not in ['IS NULL','IS NOT NULL'] and value is None:
+                continue
+            variable = variable_obj['name']
+            data_type = variable_obj['type']
+            if operator == 'between' and value2 is not None:
+                th_conditions.append(f"t.{variable} BETWEEN ? AND ?")
+                if data_type == 'number':
+                    params.extend([float(value), float(value2)])
+                else:
+                    params.extend([value, value2])
+            elif operator in ['LIKE', 'NOT LIKE']:
+                th_conditions.append(f"t.{variable} {operator} ?")
+                params.append(f"%{value}%")
+            elif operator in ['IS NULL', 'IS NOT NULL']:
+                th_conditions.append(f"t.{variable} {operator}")
+            else:
+                th_conditions.append(f"t.{variable} {operator} ?")
+                if data_type == 'number':
+                    params.append(float(value))
+                else:
+                    params.append(value)
+
+        th_sql = (" AND " + " AND ".join(th_conditions)) if th_conditions else ""
+
+        subselects.append(
+            f"""
+            SELECT t.pid
+            FROM {table_name} t
+            WHERE t.time_point IN ({','.join(['?' for _ in tps])})
+              AND {pid_filter_condition}
+              {th_sql}
+            GROUP BY t.pid
+            HAVING COUNT(DISTINCT t.time_point) = {len(tps)}{having_not_null_clause_single}
+            """
+        )
+        params_all.extend(params)
+
+    if not subselects:
+        return "SELECT pid FROM (SELECT NULL as pid) x WHERE 1=0", []
+
+    unioned = "\n            UNION ALL\n            ".join(subselects)
+    pid_only_query = f"""
+        SELECT DISTINCT pid FROM (
+            {unioned}
+        ) AS U
+    """
+    return pid_only_query, params_all
 
 @app.route('/query-data', methods=['POST'])
 def query_data():
@@ -734,6 +1189,7 @@ def query_data():
             has_thresholds = bool(lp0.get('thresholds'))
             has_cohorts = bool(lp0.get('cohorts'))
             has_variables = bool(lp0.get('variables'))
+
             if not (has_timepoints or has_thresholds or has_cohorts or has_variables):
                 return jsonify({'status': 'error', 'message': 'logicParameters must include timepoints, cohorts, thresholds, or variables'}), 400
         
@@ -744,8 +1200,39 @@ def query_data():
 
         cursor = conn.cursor()
         results = {}
+        filter_counts = []  # store per-filter counts for min-based combined
+
+        # Accumulator for a single combined table across all filters
+        combined_counts = {
+            'total': 0,
+            'children': 0,
+            'adults': 0,
+            'gender': {
+                'children': {'M': 0, 'F': 0, 'O': 0},
+                'adults': {'M': 0, 'F': 0, 'O': 0}
+            }
+        }
+
+        def add_counts(target, src):
+            target['total'] += int(src.get('total', 0) or 0)
+            target['children'] += int(src.get('children', 0) or 0)
+            target['adults'] += int(src.get('adults', 0) or 0)
+            # genders
+            tga = target['gender']['adults']
+            tgc = target['gender']['children']
+            sga = ((src.get('gender') or {}).get('adults')) or {'M': 0, 'F': 0, 'O': 0}
+            sgc = ((src.get('gender') or {}).get('children')) or {'M': 0, 'F': 0, 'O': 0}
+            tga['M'] += int(sga.get('M', 0) or 0)
+            tga['F'] += int(sga.get('F', 0) or 0)
+            tga['O'] += int(sga.get('O', 0) or 0)
+            tgc['M'] += int(sgc.get('M', 0) or 0)
+            tgc['F'] += int(sgc.get('F', 0) or 0)
+            tgc['O'] += int(sgc.get('O', 0) or 0)
 
         # Process each filter
+        filter_pid_sets = []  # list of dicts pid->gender per filter
+        filter_pid_queries = []
+        filter_pid_params = []
         for filter_item in filters:
             modality = filter_item.get('modality')
             logic_parameters = filter_item.get('logicParameters') or []
@@ -759,6 +1246,7 @@ def query_data():
                 try:
                     cursor.execute(query, params)
                     rows = cursor.fetchall()
+
                     counts = {
                         'total': 0,
                         'children': 0,
@@ -769,39 +1257,313 @@ def query_data():
                         }
                     }
                     
-                    for row in rows:
-                        if row and len(row) >= 5:  # count, source, male_count, female_count, other_count
-                            count = row[0] or 0  # Use 0 if count is None
-                            source = row[1]
-                            male_count = row[2] or 0
-                            female_count = row[3] or 0
-                            other_count = row[4] or 0
+                    if modality == "genetic":
+
+                        import pandas as pd
+
+                        '''
+                        The object returned above will lack gender counts - we will need to map pids to sex and count for m/f before passing to front end. I'm not sure which table this should be mapped to from the db - but will need help with that part.
+
+                        '''
+
+                        #------------------------------------------------------------------------------------------------------------
+                        # ZACH: Hoping that the method for accessing the df from the query below will work, and same for the snp_list parameter passed in from the front end. Will need help to ensure this is coming in as an appropriate list object for the rest of the functions to work.
+                        #------------------------------------------------------------------------------------------------------------
+
+                        #Zach: run the genetic_query function from gen_query module.
+                        cols = [column[0] for column in cursor.description]
+                        df_genetic = pd.DataFrame.from_records(rows, columns=cols)
+
+                        #will need this to map possible_rsids to the desired ones for display in later applications (beyond basic counts) - when we make tables of rsids and genotype group counts.
+                        snp_list = logic_parameters[0].get('snp_list')
+
+                        #------------------------------------------------------------------------------------------------------------
+
+
+                        #run some functions to work with the queried genetic data. Note match types is just a dict that indicates if each SNP weas exact or from the possible_matches.
+                        sample_query_df, match_types = gPro.clean_genetic_query(df_genetic, snp_list)
+
+                        #Step 2. Split adults vs children based on pid string starts
+                        adult_df = sample_query_df[sample_query_df['pid'].str.startswith(('p', 's'))]
+                        child_df = sample_query_df[sample_query_df['pid'].str.startswith(('a', 'b', 'c'))]
+
+                        ### ****--------------------------------------------------------------------
+
+                        '''ZACH
+
+                        NOTE: The function calls below are to generate a table of STATS for each SNP in both children and adults - and would be separate from standard sample size counts as is happening for other modalities for the database web app. For now, these can be dis-regarded and even commented out - however, eventually this would be useful as an additional two tables to print beneath the main sample size table returned.
+
+                        '''
+
+                        #Step 3. Process each cohort into table of STATs with one row per SNP
+                        snp_stats_adult = gPro.cohort_snp_stats(adult_df, snp_list)  
+                        snp_stats_child = gPro.cohort_snp_stats(child_df, snp_list)
+
+                        #Step 4. Add warnings based on common genetic criteria
+                        snp_stats_adult = gPro.add_warnings(snp_stats_adult)
+                        snp_stats_child = gPro.add_warnings(snp_stats_child)
+      
+                        #--------------------------------------------------------------------
+                        #ZACH: THIS GIVES US THE MAIN SAMPLE SIZE COUNTS:
+                        #--------------------------------------------------------------------
+                        sample_size_counts = gPro.complete_record_count(adult_df, child_df, snp_list)
+
+                        '''
+                        The object returned above will lack gender counts - we will need to map pids to sex and count for m/f before passing to front end. I'm not sure which table this should be mapped to from the db - but will need help with that part.
+
+                        '''
+
+                        #--------------------------------------------------------------------
+                        # Map genders via participants table and compute cohort/gender counts
+                        warnings = []
+                        try:
+                            snps = snp_list or []
+                            valid_child_pids = []
+                            valid_adult_pids = []
+                            if snps:
+                                # helper to get pids with valid two-base genotypes across all SNPs
+                                def get_valid_pids(df_in, snps_in):
+                                    if df_in is None or df_in.empty:
+                                        return []
+                                    sub_df = df_in[snps_in]
+                                    sub_df = sub_df.dropna()
+                                    if sub_df.empty:
+                                        return []
+                                    valid_mask = sub_df.applymap(gPro.is_valid_genotype).all(axis=1)
+                                    if not valid_mask.any():
+                                        return []
+                                    return df_in.loc[sub_df.index[valid_mask], 'pid'].astype(str).tolist()
+                                
+                                valid_child_pids = get_valid_pids(child_df, snps)
+                                valid_adult_pids = get_valid_pids(adult_df, snps)
                             
-                            # Normalize source type to match our expected keys
-                            source_type = source.lower()  # Convert to lowercase to handle any case variations
-                            if source_type in ['children', 'adults']:  # Make sure it's a valid source type
-                                counts[source_type] = count
-                                counts['total'] += count
-                                counts['gender'][source_type]['M'] = male_count
-                                counts['gender'][source_type]['F'] = female_count
-                                counts['gender'][source_type]['O'] = other_count
+                            all_valid_pids = list({*valid_child_pids, *valid_adult_pids})
+                            pid_to_gender = {}
+                            if all_valid_pids:
+                                placeholders = ','.join(['?' for _ in all_valid_pids])
+                                cursor.execute(f"SELECT pid, gender FROM {PARTICIPANTS_TABLE} WHERE pid IN ({placeholders})", all_valid_pids)
+                                pg_rows = cursor.fetchall() or []
+                                for r in pg_rows:
+                                    pid_to_gender[str(r[0])] = r[1]
+                                missing = [pid for pid in all_valid_pids if pid not in pid_to_gender]
+                                if missing:
+                                    warnings.append(f"{len(missing)} PIDs missing in participants table; counted as 'Other'.")
+                                    for m in missing:
+                                        pid_to_gender[m] = None
+                            
+                            def normalize_gender(g):
+                                if g is None:
+                                    return 'O'
+                                s = str(g).strip()
+                                if s.upper() in ('M', 'MALE') or s.lower() == 'male':
+                                    return 'M'
+                                if s.upper() in ('F', 'FEMALE') or s.lower() == 'female':
+                                    return 'F'
+                                return 'O'
+                            
+                            # reset counts with genotype-specific totals
+                            counts = {
+                                'total': 0,
+                                'children': 0,
+                                'adults': 0,
+                                'gender': {
+                                    'children': {'M': 0, 'F': 0, 'O': 0},
+                                    'adults': {'M': 0, 'F': 0, 'O': 0}
+                                }
+                            }
+                            
+                            for pid in valid_child_pids:
+                                gnorm = normalize_gender(pid_to_gender.get(pid))
+                                counts['children'] += 1
+                                counts['total'] += 1
+                                counts['gender']['children'][gnorm] += 1
+                            
+                            for pid in valid_adult_pids:
+                                gnorm = normalize_gender(pid_to_gender.get(pid))
+                                counts['adults'] += 1
+                                counts['total'] += 1
+                                counts['gender']['adults'][gnorm] += 1
+                            
+                            results[modality] = {
+                                'counts': counts,
+                                'query': query,
+                                'warnings': warnings
+                            }
+                            continue
+                        except Exception as _:
+                            results[modality] = {
+                                'counts': counts,
+                                'query': query,
+                                'warnings': ['Failed to map genders for genotype results.']
+                            }
+                            continue
+
+                    else:
+                        
+                        for row in rows:
+                            if row and len(row) >= 5:  # count, source, male_count, female_count, other_count
+                                count = row[0] or 0  # Use 0 if count is None
+                                source = row[1]
+                                male_count = row[2] or 0
+                                female_count = row[3] or 0
+                                other_count = row[4] or 0
+                                
+                                # Normalize source type to match our expected keys
+                                source_type = source.lower()  # Convert to lowercase to handle any case variations
+                                if source_type in ['children', 'adults']:  # Make sure it's a valid source type
+                                    counts[source_type] = count
+                                    counts['total'] += count
+                                    counts['gender'][source_type]['M'] = male_count
+                                    counts['gender'][source_type]['F'] = female_count
+                                    counts['gender'][source_type]['O'] = other_count
                     
+
                     results[modality] = {
                         'counts': counts,
                         'query': query
                     }
+
                 except pyodbc.Error as e:
                     results[modality] = {
                         'error': str(e),
                         'query': query  # Include failed query for debugging
                     }
 
+                # Prepare PID-only subselect for SQL-level INTERSECT
+                try:
+                    pid_subselect_sql, pid_subselect_params = build_filter_pid_subselect(modality, logic_parameters)
+                    filter_pid_queries.append(pid_subselect_sql)
+                    filter_pid_params.extend(pid_subselect_params)
+                except Exception:
+                    pass
+
+        # Compute true intersection via SQL INTERSECT when 2+ filters
+        intersection_counts = {
+            'total': 0,
+            'children': 0,
+            'adults': 0,
+            'gender': {
+                'children': {'M': 0, 'F': 0, 'O': 0},
+                'adults': {'M': 0, 'F': 0, 'O': 0}
+            }
+        }
+        if len(filter_pid_queries) >= 2:
+            try:
+                intersect_sql = " INTERSECT ".join([f"({q})" for q in filter_pid_queries])
+                full_sql = f"""
+                    WITH Intersected AS (
+                        {intersect_sql}
+                    )
+                    SELECT 
+                        COUNT(*) as total,
+                        SUM(CASE WHEN UPPER(LEFT(pid, 1)) IN ('P', 'S') THEN 1 ELSE 0 END) as adults,
+                        SUM(CASE WHEN UPPER(LEFT(pid, 1)) IN ('A', 'B', 'C') THEN 1 ELSE 0 END) as children,
+                        SUM(CASE WHEN UPPER(LEFT(pid, 1)) IN ('P', 'S') AND (p.gender IN ('M','MALE') OR LOWER(p.gender)='male') THEN 1 ELSE 0 END) as adults_m,
+                        SUM(CASE WHEN UPPER(LEFT(pid, 1)) IN ('P', 'S') AND (p.gender IN ('F','FEMALE') OR LOWER(p.gender)='female') THEN 1 ELSE 0 END) as adults_f,
+                        SUM(CASE WHEN UPPER(LEFT(pid, 1)) IN ('P', 'S') AND p.gender IS NOT NULL AND p.gender NOT IN ('M','MALE','F','FEMALE') AND LOWER(p.gender) NOT IN ('male','female') THEN 1 ELSE 0 END) as adults_o,
+                        SUM(CASE WHEN UPPER(LEFT(pid, 1)) IN ('A', 'B', 'C') AND (p.gender IN ('M','MALE') OR LOWER(p.gender)='male') THEN 1 ELSE 0 END) as children_m,
+                        SUM(CASE WHEN UPPER(LEFT(pid, 1)) IN ('A', 'B', 'C') AND (p.gender IN ('F','FEMALE') OR LOWER(p.gender)='female') THEN 1 ELSE 0 END) as children_f,
+                        SUM(CASE WHEN UPPER(LEFT(pid, 1)) IN ('A', 'B', 'C') AND p.gender IS NOT NULL AND p.gender NOT IN ('M','MALE','F','FEMALE') AND LOWER(p.gender) NOT IN ('male','female') THEN 1 ELSE 0 END) as children_o
+                    FROM Intersected i
+                    LEFT JOIN {PARTICIPANTS_TABLE} p ON i.pid = p.pid
+                """
+                cursor.execute(full_sql, filter_pid_params)
+                row = cursor.fetchone()
+                if row:
+                    intersection_counts['total'] = int(row[0] or 0)
+                    intersection_counts['adults'] = int(row[1] or 0)
+                    intersection_counts['children'] = int(row[2] or 0)
+                    intersection_counts['gender']['adults']['M'] = int(row[3] or 0)
+                    intersection_counts['gender']['adults']['F'] = int(row[4] or 0)
+                    intersection_counts['gender']['adults']['O'] = int(row[5] or 0)
+                    intersection_counts['gender']['children']['M'] = int(row[6] or 0)
+                    intersection_counts['gender']['children']['F'] = int(row[7] or 0)
+                    intersection_counts['gender']['children']['O'] = int(row[8] or 0)
+            except Exception:
+                pass
+
+        # Fallback to Python-side intersection if SQL result is zero but per-filter sets are non-empty
+        try:
+            if intersection_counts['total'] == 0 and len(filters) >= 2:
+                pid_sets = []
+                gender_map = {}
+                for filter_item in filters:
+                    modality = filter_item.get('modality')
+                    logic_parameters = filter_item.get('logicParameters') or []
+                    if not modality:
+                        continue
+                    pid_query_full, pid_params_full = build_filter_pid_query(modality, logic_parameters)
+                    cursor.execute(pid_query_full, pid_params_full)
+                    rows = cursor.fetchall()
+                    s = set()
+                    for r in rows:
+                        if r and len(r) >= 2 and r[0] is not None:
+                            pid = str(r[0])
+                            s.add(pid)
+                            if pid not in gender_map:
+                                gender_map[pid] = r[1]
+                    if s:
+                        pid_sets.append(s)
+                if len(pid_sets) >= 2:
+                    inter = set.intersection(*pid_sets)
+                else:
+                    inter = set()
+
+                def cohort_from_pid(pid_value):
+                    if not pid_value:
+                        return 'other'
+                    ch = str(pid_value)[0].upper()
+                    if ch in ['A', 'B', 'C']:
+                        return 'children'
+                    if ch in ['P', 'S']:
+                        return 'adults'
+                    return 'other'
+
+                # Recompute counts from intersection
+                intersection_counts = {
+                    'total': 0,
+                    'children': 0,
+                    'adults': 0,
+                    'gender': {
+                        'children': {'M': 0, 'F': 0, 'O': 0},
+                        'adults': {'M': 0, 'F': 0, 'O': 0}
+                    }
+                }
+                for pid in inter:
+                    cohort = cohort_from_pid(pid)
+                    if cohort not in ['children', 'adults']:
+                        continue
+                    intersection_counts['total'] += 1
+                    intersection_counts[cohort] += 1
+                    g = (gender_map.get(pid) or 'Unknown')
+                    g_upper = str(g).upper() if isinstance(g, str) else 'UNKNOWN'
+                    if cohort == 'children':
+                        if g_upper in ['M', 'MALE']:
+                            intersection_counts['gender']['children']['M'] += 1
+                        elif g_upper in ['F', 'FEMALE']:
+                            intersection_counts['gender']['children']['F'] += 1
+                        else:
+                            intersection_counts['gender']['children']['O'] += 1
+                    else:
+                        if g_upper in ['M', 'MALE']:
+                            intersection_counts['gender']['adults']['M'] += 1
+                        elif g_upper in ['F', 'FEMALE']:
+                            intersection_counts['gender']['adults']['F'] += 1
+                        else:
+                            intersection_counts['gender']['adults']['O'] += 1
+        except Exception:
+            pass
+
+        # Attach Combined from true intersection (even if zero) for multi-filter searches
+        if isinstance(filters, list) and len(filters) >= 2:
+            results['Combined'] = { 'counts': intersection_counts }
+
         cursor.close()
         conn.close()
 
         return jsonify({
             'status': 'success',
-            'results': results
+            'results': _redact_results_small_cells(results)
         })
 
     except Exception as e:

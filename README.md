@@ -140,6 +140,14 @@ then paste the db credentials:
  
 ## Running the Application
  
+ 
+Open the main folder(DATABASEAPP) in terminal and run the following command:
+
+ #### Windows:
+   ```bash
+   python start_app.py
+   ```
+ #### macOS:
 Connect to vpn the open the main folder(DATABASEAPP) in terminal and run the following command:
  
    ```bash
@@ -148,6 +156,7 @@ Connect to vpn the open the main folder(DATABASEAPP) in terminal and run the fol
  
 the App should now open in your browser!
 
+Dont forget to connect to vpn also!
 
 ## Fetching New Updates from Github
 
